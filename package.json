@@ -1,22 +1,17 @@
 {
   "name": "the-platform-server",
   "version": "1.0.0",
-  "description": "Node.js relay server for The Platform private messaging app.",
+  "description": "Backend server for The Platform chat application",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
-  "keywords": [
-    "websocket",
-    "chat",
-    "relay",
-    "privacy",
-    "p2p"
-  ],
-  "author": "Prakhar Solanki",
-  "license": "ISC",
   "dependencies": {
     "express": "^4.19.2",
-    "ws": "^8.18.0"
+    "ws": "^8.18.0",
+    "uuid": "^10.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
   }
 }
