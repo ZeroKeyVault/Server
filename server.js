@@ -4,17 +4,17 @@ const http = require('http');
 const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
-const crypto = require('crypto'); // Node.js crypto module for key derivation
+const { v4: uuidv4 } = require('uuid'); // Import uuid for generating unique IDs
 
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080; // Use PORT env variable for Render deployment
 
-// --- Server-side Data Storage (Simple JSON files for demo) ---
-// In a production environment, use a robust database (e.g., PostgreSQL, MongoDB)
-// and proper authentication/authorization.
+console.log('WebSocket server starting...');
+
+// --- Server Data Storage ---
 const DATA_DIR = path.join(__dirname, 'data');
 const VAULTS_FILE = path.join(DATA_DIR, 'vaults.json');
 const OFFLINE_MESSAGES_FILE = path.join(DATA_DIR, 'offline_messages.json');
@@ -24,16 +24,16 @@ if (!fs.existsSync(DATA_DIR)) {
     fs.mkdirSync(DATA_DIR);
 }
 
-let vaults = {}; // vaultId -> { name, type, expiration, adminId, encryptedKeyB64, ivB64, saltB64, used (for private), members: Set<userId> }
-let offlineMessages = {}; // userId -> [{ vaultId, senderId, encryptedMessage, iv, timestamp, isFile, fileName, fileMimeType }]
-let connectedClients = {}; // userId -> WebSocket
+// Global data structures (loaded from/saved to files)
+// Stored vaultId -> { vaultName, vaultType, vaultHash, encryptedAesKeyB64, saltB64, ivB64, expiration, participants: [] }
+let vaults = {};
+// Stored userId -> [{ messageData }]
+let offlineMessages = {};
 
-/**
- * Loads data from a JSON file.
- * @param {string} filePath - Path to the JSON file.
- * @param {object} defaultData - Default data if file doesn't exist or is empty.
- * @returns {object} Parsed data.
- */
+// Active WebSocket connections: userId -> WebSocket object
+const connectedClients = new Map();
+
+// Helper to load data from JSON files
 function loadData(filePath, defaultData) {
     try {
         if (fs.existsSync(filePath)) {
@@ -41,379 +41,366 @@ function loadData(filePath, defaultData) {
             return JSON.parse(data);
         }
     } catch (error) {
-        console.error(`Error loading data from ${filePath}:`, error.message);
+        console.error(`Error loading ${filePath}:`, error.message);
     }
     return defaultData;
 }
 
-/**
- * Saves data to a JSON file.
- * @param {string} filePath - Path to the JSON file.
- * @param {object} data - Data to save.
- */
+// Helper to save data to JSON files
 function saveData(filePath, data) {
     try {
         fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
     } catch (error) {
-        console.error(`Error saving data to ${filePath}:`, error.message);
+        console.error(`Error saving ${filePath}:`, error.message);
     }
 }
 
-// Load initial data
+// Load initial data on server start
 vaults = loadData(VAULTS_FILE, {});
-// Convert members arrays back to Sets if loaded from JSON
+// Convert participants arrays back to Sets if needed for internal logic (though arrays are fine for JSON)
 for (const vaultId in vaults) {
-    if (vaults[vaultId].members) {
-        vaults[vaultId].members = new Set(vaults[vaultId].members);
-    } else {
-        vaults[vaultId].members = new Set();
+    if (vaults[vaultId].participants && !Array.isArray(vaults[vaultId].participants)) {
+        // This handles older formats if necessary, ensuring 'participants' is an array.
+        // In this specific implementation, it should always be an array.
+        vaults[vaultId].participants = Array.from(vaults[vaultId].participants);
     }
 }
 offlineMessages = loadData(OFFLINE_MESSAGES_FILE, {});
 
-// --- Cryptography on Server (for vault key encryption/decryption) ---
-// This part is crucial for "The Laughing Buddha Protocol" to ensure the server
-// never sees the plaintext vault keys or messages.
-
-/**
- * Derives a cryptographic key from a given password (hash) using PBKDF2.
- * This is used to encrypt/decrypt the vault's main AES key.
- * Server-side equivalent of client's deriveKeyFromHash.
- * @param {string} password - The vault hash (password).
- * @param {Buffer} salt - A unique salt for key derivation.
- * @returns {Promise<Buffer>} The derived key.
- */
-async function deriveKeyFromHashServer(password, salt) {
-    return new Promise((resolve, reject) => {
-        crypto.pbkdf2(password, salt, 100000, 32, 'sha256', (err, derivedKey) => {
-            if (err) reject(err);
-            resolve(derivedKey);
-        });
-    });
+// Helper to convert expiration string (e.g., "1h", "1mo") to a Date object
+function parseExpiration(expirationStr) {
+    const now = new Date();
+    switch (expirationStr) {
+        case '1h': return new Date(now.getTime() + 60 * 60 * 1000);
+        case '5h': return new Date(now.getTime() + 5 * 60 * 60 * 1000);
+        case '24h': return new Date(now.getTime() + 24 * 60 * 60 * 1000);
+        case '1mo': return new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000); // Approximate month
+        case '3mo': return new Date(now.getTime() + 3 * 30 * 24 * 60 * 60 * 1000);
+        case '6mo': return new Date(now.getTime() + 6 * 30 * 24 * 60 * 60 * 1000);
+        case '1yr': return new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000);
+        case 'never': return new Date(8640000000000000); // Max possible Date, effectively never
+        default: return new Date(now.getTime() + 24 * 60 * 60 * 1000); // Default 24 hours
+    }
 }
 
-/**
- * Encrypts data using AES-256-GCM.
- * @param {Buffer} data - The data to encrypt.
- * @param {Buffer} key - The AES key (32 bytes).
- * @param {Buffer} iv - The IV (16 bytes).
- * @returns {Buffer} Encrypted data.
- */
-function encryptDataServer(data, key, iv) {
-    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
-    const encrypted = Buffer.concat([cipher.update(data), cipher.final()]);
-    const tag = cipher.getAuthTag();
-    return Buffer.concat([encrypted, tag]); // Append auth tag
-}
+// --- WebSocket Server ---
+wss.on('connection', ws => {
+    let currentUserId = null; // Store userId for this connection
 
-/**
- * Decrypts data using AES-256-GCM.
- * @param {Buffer} encryptedDataWithTag - The encrypted data with auth tag.
- * @param {Buffer} key - The AES key (32 bytes).
- * @param {Buffer} iv - The IV (16 bytes).
- * @returns {Buffer} Decrypted data.
- */
-function decryptDataServer(encryptedDataWithTag, key, iv) {
-    const tagLength = 16; // AES-GCM default tag length
-    const encryptedData = encryptedDataWithTag.slice(0, encryptedDataWithTag.length - tagLength);
-    const tag = encryptedDataWithTag.slice(encryptedDataWithTag.length - tagLength);
+    console.log('Client connected');
 
-    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
-    decipher.setAuthTag(tag);
-    const decrypted = Buffer.concat([decipher.update(encryptedData), decipher.final()]);
-    return decrypted;
-}
-
-
-// --- WebSocket Server Logic ---
-
-wss.on('connection', (ws) => {
-    let currentUserId = null; // Will be set after 'register' message
-
-    ws.on('message', async (message) => {
-        const data = JSON.parse(message.toString());
-        console.log('Received from client:', data.type, data.userId || '');
-
-        if (data.type === 'register') {
-            currentUserId = data.userId;
-            connectedClients[currentUserId] = ws;
-            console.log(`User ${currentUserId} connected.`);
-
-            // Send any pending offline messages to the newly connected user
-            if (offlineMessages[currentUserId] && offlineMessages[currentUserId].length > 0) {
-                ws.send(JSON.stringify({ type: 'offline_messages', messages: offlineMessages[currentUserId] }));
-                delete offlineMessages[currentUserId]; // Clear after sending
-                saveData(OFFLINE_MESSAGES_FILE, offlineMessages);
-                console.log(`Sent ${offlineMessages[currentUserId]?.length || 0} offline messages to ${currentUserId}`);
-            }
-        } else if (!currentUserId) {
-            // Reject messages if user is not registered yet
-            ws.send(JSON.stringify({ type: 'error', message: 'Please register your user ID first.' }));
+    ws.on('message', message => {
+        let parsedMessage;
+        try {
+            parsedMessage = JSON.parse(message);
+        } catch (e) {
+            console.error('Failed to parse message:', message, e);
+            ws.send(JSON.stringify({ type: 'error', message: 'Invalid JSON format.' }));
             return;
         }
 
-        switch (data.type) {
+        console.log('Received:', parsedMessage.type, 'from', parsedMessage.userId ? parsedMessage.userId.substring(0,8) + '...' : 'unknown');
+
+        switch (parsedMessage.type) {
+            case 'register':
+                currentUserId = parsedMessage.userId;
+                connectedClients.set(currentUserId, ws);
+                console.log(`User ${currentUserId.substring(0,8)}... registered.`);
+
+                // Send any pending offline messages
+                if (offlineMessages[currentUserId] && offlineMessages[currentUserId].length > 0) {
+                    ws.send(JSON.stringify({
+                        type: 'offline_messages',
+                        messages: offlineMessages[currentUserId]
+                    }));
+                    delete offlineMessages[currentUserId]; // Clear after sending
+                    saveData(OFFLINE_MESSAGES_FILE, offlineMessages);
+                }
+                break;
+
             case 'create_vault':
-                const vaultId = crypto.randomUUID();
-                const vaultHash = crypto.randomBytes(16).toString('hex'); // Unique hash for joining
-                const rawVaultKey = Buffer.from(data.rawVaultKeyB64, 'base64'); // Raw AES key from client
-                const salt = Buffer.from(data.saltB64, 'base64'); // Salt from client
+                // Ensure currentUserId is set before creating vaults
+                if (!currentUserId) {
+                    ws.send(JSON.stringify({ type: 'error', message: 'User not registered. Please refresh.' }));
+                    return;
+                }
 
-                // Server encrypts the raw vault key using a key derived from the vaultHash
-                const derivedKeyForVaultKey = await deriveKeyFromHashServer(vaultHash, salt);
-                const ivForVaultKey = crypto.randomBytes(16); // IV for encrypting the vault key
-                const encryptedVaultKey = encryptDataServer(rawVaultKey, derivedKeyForVaultKey, ivForVaultKey);
+                const vaultId = uuidv4();
+                const expirationDate = parseExpiration(parsedMessage.expiration);
 
-                vaults[vaultId] = {
-                    name: data.vaultName,
-                    type: data.vaultType,
-                    expiration: data.expiration,
-                    adminId: currentUserId, // Admin for public vaults
-                    encryptedKeyB64: encryptedVaultKey.toString('base64'), // Store encrypted key
-                    ivB64: ivForVaultKey.toString('base64'), // Store IV for key encryption
-                    saltB64: salt.toString('base64'), // Store salt for key derivation
-                    used: data.vaultType === 'private' ? false : true, // Private hash used once
-                    members: new Set([currentUserId]),
-                    createdAt: Date.now() // For expiration
+                const newVault = {
+                    id: vaultId,
+                    name: parsedMessage.vaultName,
+                    type: parsedMessage.vaultType,
+                    vaultHash: parsedMessage.vaultHash,
+                    encryptedAesKeyB64: parsedMessage.encryptedAesKeyB64,
+                    saltB64: parsedMessage.saltB64,
+                    ivB64: parsedMessage.ivB64,
+                    expiration: expirationDate.toISOString(),
+                    participants: [currentUserId] // Creator is the first participant
                 };
-                saveData(VAULTS_FILE, vaults);
+                vaults[vaultId] = newVault; // Store in object
+                saveData(VAULTS_FILE, vaults); // Persist
 
-                // Send back the vault details and the encrypted key to the creator
                 ws.send(JSON.stringify({
                     type: 'vault_created',
                     vaultId: vaultId,
-                    vaultHash: vaultHash,
-                    vaultName: data.vaultName,
-                    vaultType: data.vaultType,
-                    expiration: data.expiration,
-                    encryptedKeyB64: encryptedVaultKey.toString('base64'),
-                    ivB64: ivForVaultKey.toString('base64'),
-                    saltB64: salt.toString('base64')
+                    vaultName: parsedMessage.vaultName,
+                    vaultType: parsedMessage.vaultType,
+                    vaultHash: parsedMessage.vaultHash,
+                    encryptedAesKeyB64: parsedMessage.encryptedAesKeyB64,
+                    saltB64: parsedMessage.saltB64,
+                    ivB64: parsedMessage.ivB64,
+                    expiration: newVault.expiration,
+                    participants: newVault.participants
                 }));
-                console.log(`Vault ${vaultId} created by ${currentUserId}. Hash: ${vaultHash}`);
+                console.log(`Vault ${vaultId.substring(0,8)}... created by ${currentUserId.substring(0,8)}...`);
                 break;
 
             case 'join_vault':
-                const { vaultHash: joinHash, vaultName: userVaultName } = data;
-                let foundVaultId = null;
+                // Ensure currentUserId is set
+                if (!currentUserId) {
+                    ws.send(JSON.stringify({ type: 'error', message: 'User not registered. Please refresh.' }));
+                    return;
+                }
 
-                // Find the vault by hash
+                let targetVault = null;
                 for (const id in vaults) {
-                    const vault = vaults[id];
-                    // Re-derive the hash to compare (this is inefficient, but ensures hash is not stored directly)
-                    // A better way would be to store a hash of the hash, or have a separate lookup table.
-                    // For this demo, we'll iterate and check.
-                    const tempSalt = Buffer.from(vault.saltB64, 'base64');
-                    const tempDerivedKey = await deriveKeyFromHashServer(joinHash, tempSalt);
-                    try {
-                        // Attempt to decrypt the vault key with the provided hash
-                        const tempDecryptedKey = decryptDataServer(
-                            Buffer.from(vault.encryptedKeyB64, 'base64'),
-                            tempDerivedKey,
-                            Buffer.from(vault.ivB64, 'base64')
-                        );
-                        // If decryption succeeds, it means the hash is correct
-                        foundVaultId = id;
+                    if (vaults[id].vaultHash === parsedMessage.vaultHash) {
+                        targetVault = vaults[id];
                         break;
-                    } catch (e) {
-                        // Decryption failed, not the correct hash or key
-                        continue;
                     }
                 }
 
-                if (foundVaultId) {
-                    const vault = vaults[foundVaultId];
-                    if (vault.type === 'private' && vault.used) {
-                        ws.send(JSON.stringify({ type: 'error', message: 'This private vault hash has already been used.' }));
-                        return;
+                if (targetVault) {
+                    if (!targetVault.participants.includes(currentUserId)) {
+                        targetVault.participants.push(currentUserId);
+                        saveData(VAULTS_FILE, vaults); // Persist change
+                        console.log(`User ${currentUserId.substring(0,8)}... joined vault ${targetVault.id.substring(0,8)}...`);
+                    } else {
+                        console.log(`User ${currentUserId.substring(0,8)}... already in vault ${targetVault.id.substring(0,8)}...`);
                     }
 
-                    vault.members.add(currentUserId);
-                    if (vault.type === 'private') {
-                        vault.used = true; // Mark hash as used for private vaults
-                    }
-                    saveData(VAULTS_FILE, vaults);
-
-                    // Send the encrypted vault key and IV to the joiner
+                    // Send vault_joined to the joining client
                     ws.send(JSON.stringify({
                         type: 'vault_joined',
-                        joinedVaultId: foundVaultId,
-                        joinedVaultName: userVaultName, // Use the name given by the joiner
-                        joinedVaultType: vault.type,
-                        joinedExpiration: vault.expiration,
-                        encryptedKeyB64: vault.encryptedKeyB64, // Send the encrypted key
-                        ivB64: vault.ivB64, // Send the IV for key encryption
-                        saltB64: vault.saltB64, // Send the salt for key derivation
-                        vaultHash: joinHash // Send the hash back so client can derive key
+                        vaultId: targetVault.id,
+                        vaultName: parsedMessage.vaultName, // Client's preferred name for display
+                        vaultType: targetVault.type,
+                        vaultHash: targetVault.vaultHash,
+                        encryptedAesKeyB64: targetVault.encryptedAesKeyB64,
+                        saltB64: targetVault.saltB64,
+                        ivB64: targetVault.ivB64,
+                        expiration: targetVault.expiration,
+                        participants: targetVault.participants
                     }));
-                    console.log(`User ${currentUserId} joined vault ${foundVaultId}.`);
 
-                    // Send any pending offline messages for this vault to the new member
-                    if (offlineMessages[currentUserId]) {
-                        const relevantMessages = offlineMessages[currentUserId].filter(msg => msg.vaultId === foundVaultId);
-                        if (relevantMessages.length > 0) {
-                            ws.send(JSON.stringify({ type: 'offline_messages', messages: relevantMessages }));
-                            // Remove only the sent messages from offline store
-                            offlineMessages[currentUserId] = offlineMessages[currentUserId].filter(msg => msg.vaultId !== foundVaultId);
-                            if (offlineMessages[currentUserId].length === 0) {
-                                delete offlineMessages[currentUserId];
-                            }
-                            saveData(OFFLINE_MESSAGES_FILE, offlineMessages);
+                    // Notify other active participants in the vault about the new join
+                    targetVault.participants.forEach(participantId => {
+                        if (participantId !== currentUserId && connectedClients.has(participantId)) {
+                            const otherClientWs = connectedClients.get(participantId);
+                            otherClientWs.send(JSON.stringify({
+                                type: 'vault_joined', // Use vault_joined to trigger participant update on client
+                                vaultId: targetVault.id,
+                                vaultName: targetVault.name, // Server's original name
+                                vaultType: targetVault.type,
+                                vaultHash: targetVault.vaultHash,
+                                encryptedAesKeyB64: targetVault.encryptedAesKeyB64,
+                                saltB64: targetVault.saltB64,
+                                ivB64: targetVault.ivB64,
+                                expiration: targetVault.expiration,
+                                participants: targetVault.participants // Send updated participants list
+                            }));
+                            console.log(`Notified ${participantId.substring(0,8)}... about vault ${targetVault.id.substring(0,8)}... participant change.`);
                         }
-                    }
+                    });
 
                 } else {
-                    ws.send(JSON.stringify({ type: 'error', message: 'Vault not found or hash is incorrect/expired.' }));
+                    ws.send(JSON.stringify({ type: 'error', message: 'Vault not found with that hash.' }));
+                    console.warn(`Join attempt failed: Vault not found for hash ${parsedMessage.vaultHash}.`);
                 }
                 break;
 
-            case 'send_message':
-                const { vaultId: msgVaultId, senderId, encryptedMessage, iv, timestamp, isFile, fileName, fileMimeType } = data;
-                const vault = vaults[msgVaultId];
+            case 'reconnect_vault':
+                // Ensure currentUserId is set
+                if (!currentUserId) {
+                    ws.send(JSON.stringify({ type: 'error', message: 'User not registered. Please refresh.' }));
+                    return;
+                }
 
-                if (vault && vault.members.has(senderId)) {
-                    const messageToSend = {
-                        type: 'new_message',
-                        vaultId: msgVaultId,
-                        senderId: senderId,
-                        encryptedMessage: encryptedMessage, // Server only relays encrypted content
-                        iv: iv,
-                        timestamp: timestamp,
-                        isFile: isFile,
-                        fileName: fileName,
-                        fileMimeType: fileMimeType
-                    };
+                const reconVault = vaults[parsedMessage.vaultId];
+                if (reconVault) {
+                    if (!reconVault.participants.includes(currentUserId)) {
+                        reconVault.participants.push(currentUserId);
+                        saveData(VAULTS_FILE, vaults); // Persist change
+                        console.log(`User ${currentUserId.substring(0,8)}... re-registered in vault ${reconVault.id.substring(0,8)}...`);
+                    }
+                    // Inform other active participants that this user is now online/active in the vault
+                    reconVault.participants.forEach(participantId => {
+                        if (participantId !== currentUserId && connectedClients.has(participantId)) {
+                            const otherClientWs = connectedClients.get(participantId);
+                            otherClientWs.send(JSON.stringify({
+                                type: 'vault_joined', // Use vault_joined to update client's participants list
+                                vaultId: reconVault.id,
+                                vaultName: reconVault.name,
+                                vaultType: reconVault.type,
+                                vaultHash: reconVault.vaultHash,
+                                encryptedAesKeyB64: reconVault.encryptedAesKeyB64,
+                                saltB64: reconVault.saltB64,
+                                ivB64: reconVault.ivB64,
+                                expiration: reconVault.expiration,
+                                participants: reconVault.participants
+                            }));
+                             console.log(`Notified ${participantId.substring(0,8)}... about ${currentUserId.substring(0,8)}... rejoining vault ${reconVault.id.substring(0,8)}...`);
+                        }
+                    });
+                } else {
+                    ws.send(JSON.stringify({ type: 'error', message: `Vault ${parsedMessage.vaultId.substring(0,8)}... is no longer known to the server. Please create or re-join.` }));
+                    console.warn(`Reconnect failed: Vault ${parsedMessage.vaultId.substring(0,8)}... not found on server.`);
+                }
+                break;
 
-                    vault.members.forEach(memberId => {
-                        if (memberId !== senderId) { // Don't send back to sender
-                            const recipientWs = connectedClients[memberId];
-                            if (recipientWs && recipientWs.readyState === WebSocket.OPEN) {
-                                recipientWs.send(JSON.stringify(messageToSend));
+            case 'send_message': // This covers text messages and file chunks that fall back to server
+            case 'file_chunk': // This type is primarily for P2P but handled by server if P2P fails
+            case 'chat_message': // This type is primarily for P2P but handled by server if P2P fails
+                // Ensure currentUserId is set
+                if (!currentUserId) {
+                    ws.send(JSON.stringify({ type: 'error', message: 'User not registered. Please refresh.' }));
+                    return;
+                }
+
+                const { vaultId, senderId, encryptedMessage, iv, timestamp, isFile, fileName, fileMimeType, fileId, chunkIndex, totalChunks } = parsedMessage;
+                const vaultToSend = vaults[vaultId];
+
+                if (vaultToSend) {
+                    // Check for expired vaults
+                    if (new Date(vaultToSend.expiration) < new Date()) {
+                        delete vaults[vaultId];
+                        saveData(VAULTS_FILE, vaults);
+                        console.log(`Vault ${vaultId.substring(0,8)}... expired and removed.`);
+                        ws.send(JSON.stringify({ type: 'error', message: `Vault "${vaultToSend.name}" has expired and is no longer active.` }));
+                        return;
+                    }
+
+                    // Iterate over participants and send message
+                    vaultToSend.participants.forEach(participantId => {
+                        if (participantId !== senderId) { // Don't send back to sender
+                            const clientWs = connectedClients.get(participantId);
+                            const messageToSend = {
+                                type: 'new_message', // General type for client to process server-relayed messages
+                                vaultId: vaultId,
+                                senderId: senderId,
+                                encryptedMessage: encryptedMessage,
+                                iv: iv,
+                                timestamp: timestamp,
+                                isFile: isFile,
+                                fileName: fileName,
+                                fileMimeType: fileMimeType,
+                                fileId: fileId,
+                                chunkIndex: chunkIndex,
+                                totalChunks: totalChunks
+                            };
+
+                            if (clientWs && clientWs.readyState === WebSocket.OPEN) {
+                                clientWs.send(JSON.stringify(messageToSend));
+                                // console.log(`Relayed message from ${senderId.substring(0,8)}... to ${participantId.substring(0,8)}... in vault ${vaultId.substring(0,8)}...`);
                             } else {
                                 // Store for offline delivery
-                                if (!offlineMessages[memberId]) {
-                                    offlineMessages[memberId] = [];
+                                if (!offlineMessages[participantId]) {
+                                    offlineMessages[participantId] = [];
                                 }
-                                offlineMessages[memberId].push(messageToSend);
+                                offlineMessages[participantId].push(messageToSend);
                                 saveData(OFFLINE_MESSAGES_FILE, offlineMessages);
-                                console.log(`Stored offline message for ${memberId} in vault ${msgVaultId}`);
+                                console.log(`Stored message for offline user ${participantId.substring(0,8)}... in vault ${vaultId.substring(0,8)}...`);
                             }
                         }
                     });
                 } else {
-                    ws.send(JSON.stringify({ type: 'error', message: 'Vault not found or you are not a member.' }));
+                    ws.send(JSON.stringify({ type: 'error', message: 'Vault not found or expired.' }));
+                    console.warn(`Message send failed: Vault ${vaultId.substring(0,8)}... not found or expired.`);
+                }
+                break;
+
+            case 'webrtc_signal': // Signaling messages from client
+                // Ensure currentUserId is set
+                if (!currentUserId) {
+                    ws.send(JSON.stringify({ type: 'error', message: 'User not registered. Please refresh.' }));
+                    return;
+                }
+                const { fromUserId, toUserId, signalData, vaultId: signalVaultId } = parsedMessage; // Renamed vaultId to signalVaultId to avoid conflict
+                const targetClientWs = connectedClients.get(toUserId);
+
+                if (targetClientWs && targetClientWs.readyState === WebSocket.OPEN) {
+                    targetClientWs.send(JSON.stringify({
+                        type: 'webrtc_signal',
+                        fromUserId: fromUserId,
+                        toUserId: toUserId,
+                        signalData: signalData,
+                        vaultId: signalVaultId // Pass vaultId back to client
+                    }));
+                    // console.log(`Relayed WebRTC signal from ${fromUserId.substring(0,8)}... to ${toUserId.substring(0,8)}... for vault ${signalVaultId.substring(0,8)}...`);
+                } else {
+                    // This scenario is expected: if target user is offline, P2P won't work, and client will fall back to server.
+                    // No error needs to be sent back to the client unless signaling is critical for server logic.
+                    // console.warn(`Target client ${toUserId.substring(0,8)}... for WebRTC signal is offline or not found.`);
                 }
                 break;
 
             case 'nuke':
-                const nukeUserId = data.userId;
-                console.log(`Nuke request received for user: ${nukeUserId}`);
+                // Ensure currentUserId is set
+                if (!currentUserId) {
+                    ws.send(JSON.stringify({ type: 'error', message: 'User not registered. Cannot nuke.' }));
+                    return;
+                }
+                const nukeUserId = currentUserId; // Nuke only the current user's data
 
-                // Remove user from all vaults
-                for (const id in vaults) {
-                    if (vaults[id].members.has(nukeUserId)) {
-                        vaults[id].members.delete(nukeUserId);
-                        // If a private vault becomes empty, consider deleting it or marking it for deletion
-                        if (vaults[id].type === 'private' && vaults[id].members.size === 0) {
-                            console.log(`Private vault ${id} is now empty after nuke, marking for deletion.`);
-                            // We can set a flag or short expiration to clean up empty private vaults
-                            // For this demo, we'll just leave it empty until its natural expiration
+                // Remove user from all vaults they participated in
+                for (const vaultId in vaults) {
+                    const vault = vaults[vaultId];
+                    if (vault.participants) {
+                        const index = vault.participants.indexOf(nukeUserId);
+                        if (index > -1) {
+                            vault.participants.splice(index, 1);
+                            console.log(`User ${nukeUserId.substring(0,8)}... removed from vault ${vaultId.substring(0,8)}...`);
                         }
                     }
+                    // If a vault becomes empty after nuke, delete it
+                    if (vault.participants.length === 0) {
+                        delete vaults[vaultId];
+                        console.log(`Vault ${vaultId.substring(0,8)}... is now empty and removed.`);
+                    }
                 }
-                saveData(VAULTS_FILE, vaults);
+                saveData(VAULTS_FILE, vaults); // Persist changes to vaults
 
-                // Clear offline messages for this user
-                if (offlineMessages[nukeUserId]) {
-                    delete offlineMessages[nukeUserId];
-                    saveData(OFFLINE_MESSAGES_FILE, offlineMessages);
-                }
+                // Clear any offline messages for this user
+                delete offlineMessages[nukeUserId];
+                saveData(OFFLINE_MESSAGES_FILE, offlineMessages);
 
-                // Disconnect the client
-                if (connectedClients[nukeUserId]) {
-                    connectedClients[nukeUserId].close();
-                    delete connectedClients[nukeUserId];
-                }
-                console.log(`User ${nukeUserId} data nuked from server.`);
+                console.log(`All server data for user ${nukeUserId.substring(0,8)}... nuked.`);
                 break;
 
             default:
                 ws.send(JSON.stringify({ type: 'error', message: 'Unknown message type.' }));
-                break;
+                console.warn('Unknown message type received:', parsedMessage.type);
         }
     });
 
     ws.on('close', () => {
         if (currentUserId) {
-            delete connectedClients[currentUserId];
-            console.log(`User ${currentUserId} disconnected.`);
+            connectedClients.delete(currentUserId);
+            console.log(`Client ${currentUserId.substring(0,8)}... disconnected.`);
+        } else {
+            console.log('An unregistered client disconnected.');
         }
     });
 
-    ws.on('error', (error) => {
+    ws.on('error', error => {
         console.error('WebSocket error:', error);
     });
 });
 
-// --- Vault Expiration Logic ---
-function checkVaultExpirations() {
-    const now = Date.now();
-    let changed = false;
-    for (const vaultId in vaults) {
-        const vault = vaults[vaultId];
-        if (vault.expiration === 'never') continue;
-
-        let expirationTimeMs;
-        const [value, unit] = vault.expiration.match(/(\d+)([hmy])/).slice(1);
-        const numValue = parseInt(value);
-
-        switch (unit) {
-            case 'h': expirationTimeMs = numValue * 60 * 60 * 1000; break;
-            case 'd': expirationTimeMs = numValue * 24 * 60 * 60 * 1000; break; // 'd' for days, though client uses '24h'
-            case 'm': expirationTimeMs = numValue * 30 * 24 * 60 * 60 * 1000; break; // Approx month
-            case 'y': expirationTimeMs = numValue * 365 * 24 * 60 * 60 * 1000; break; // Approx year
-            default: expirationTimeMs = 0; // Should not happen with client validation
-        }
-
-        if (vault.createdAt + expirationTimeMs < now) {
-            console.log(`Vault ${vault.name} (${vaultId}) has expired. Deleting.`);
-            // Notify members before deleting
-            vault.members.forEach(memberId => {
-                const memberWs = connectedClients[memberId];
-                if (memberWs && memberWs.readyState === WebSocket.OPEN) {
-                    memberWs.send(JSON.stringify({
-                        type: 'vault_expired_notification',
-                        expiredVaultId: vaultId,
-                        expiredVaultName: vault.name
-                    }));
-                }
-                // Also remove any offline messages for this vault
-                if (offlineMessages[memberId]) {
-                    offlineMessages[memberId] = offlineMessages[memberId].filter(msg => msg.vaultId !== vaultId);
-                    if (offlineMessages[memberId].length === 0) {
-                        delete offlineMessages[memberId];
-                    }
-                }
-            });
-            delete vaults[vaultId];
-            changed = true;
-        }
-    }
-    if (changed) {
-        saveData(VAULTS_FILE, vaults);
-        saveData(OFFLINE_MESSAGES_FILE, offlineMessages); // Save updated offline messages
-    }
-}
-
-// Check expirations every minute
-setInterval(checkVaultExpirations, 60 * 1000);
-
-// --- Basic HTTP Server for Health Check (for Render) ---
-app.get('/', (req, res) => {
-    res.send('The Platform Relay Server is running.');
-});
-
 server.listen(PORT, () => {
     console.log(`Server listening on port ${PORT}`);
+    console.log(`WebSocket server is running on ws://localhost:${PORT}`);
+    console.log(`Remember to update the SERVER_URL in Voltas.html to your Render URL.`);
 });
-
