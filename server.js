@@ -102,7 +102,7 @@ wss.on('connection', ws => {
         console.log('Received:', parsedMessage.type, 'from', parsedMessage.userId ? parsedMessage.userId.substring(0,8) + '...' : 'unknown');
 
         switch (parsedMessage.type) {
-            case 'register':
+            case 'register': { // Added block scope
                 currentUserId = parsedMessage.userId;
                 connectedClients.set(currentUserId, ws);
                 console.log(`User ${currentUserId.substring(0,8)}... registered.`);
@@ -117,8 +117,9 @@ wss.on('connection', ws => {
                     saveData(OFFLINE_MESSAGES_FILE, offlineMessages);
                 }
                 break;
+            }
 
-            case 'create_vault':
+            case 'create_vault': { // Added block scope
                 // Ensure currentUserId is set before creating vaults
                 if (!currentUserId) {
                     ws.send(JSON.stringify({ type: 'error', message: 'User not registered. Please refresh.' }));
@@ -156,8 +157,9 @@ wss.on('connection', ws => {
                 }));
                 console.log(`Vault ${vaultId.substring(0,8)}... created by ${currentUserId.substring(0,8)}...`);
                 break;
+            }
 
-            case 'join_vault':
+            case 'join_vault': { // Added block scope
                 // Ensure currentUserId is set
                 if (!currentUserId) {
                     ws.send(JSON.stringify({ type: 'error', message: 'User not registered. Please refresh.' }));
@@ -220,8 +222,9 @@ wss.on('connection', ws => {
                     console.warn(`Join attempt failed: Vault not found for hash ${parsedMessage.vaultHash}.`);
                 }
                 break;
+            }
 
-            case 'reconnect_vault':
+            case 'reconnect_vault': { // Added block scope
                 // Ensure currentUserId is set
                 if (!currentUserId) {
                     ws.send(JSON.stringify({ type: 'error', message: 'User not registered. Please refresh.' }));
@@ -259,10 +262,11 @@ wss.on('connection', ws => {
                     console.warn(`Reconnect failed: Vault ${parsedMessage.vaultId.substring(0,8)}... not found on server.`);
                 }
                 break;
+            }
 
             case 'send_message': // This covers text messages and file chunks that fall back to server
             case 'file_chunk': // This type is primarily for P2P but handled by server if P2P fails
-            case 'chat_message': // This type is primarily for P2P but handled by server if P2P fails
+            case 'chat_message': { // This type is primarily for P2P but handled by server if P2P fails
                 // Ensure currentUserId is set
                 if (!currentUserId) {
                     ws.send(JSON.stringify({ type: 'error', message: 'User not registered. Please refresh.' }));
@@ -320,8 +324,9 @@ wss.on('connection', ws => {
                     console.warn(`Message send failed: Vault ${vaultId.substring(0,8)}... not found or expired.`);
                 }
                 break;
+            }
 
-            case 'webrtc_signal': // Signaling messages from client
+            case 'webrtc_signal': { // Added block scope
                 // Ensure currentUserId is set
                 if (!currentUserId) {
                     ws.send(JSON.stringify({ type: 'error', message: 'User not registered. Please refresh.' }));
@@ -345,8 +350,9 @@ wss.on('connection', ws => {
                     // console.warn(`Target client ${toUserId.substring(0,8)}... for WebRTC signal is offline or not found.`);
                 }
                 break;
+            }
 
-            case 'nuke':
+            case 'nuke': { // Added block scope
                 // Ensure currentUserId is set
                 if (!currentUserId) {
                     ws.send(JSON.stringify({ type: 'error', message: 'User not registered. Cannot nuke.' }));
@@ -378,10 +384,12 @@ wss.on('connection', ws => {
 
                 console.log(`All server data for user ${nukeUserId.substring(0,8)}... nuked.`);
                 break;
+            }
 
-            default:
+            default: { // Added block scope
                 ws.send(JSON.stringify({ type: 'error', message: 'Unknown message type.' }));
                 console.warn('Unknown message type received:', parsedMessage.type);
+            }
         }
     });
 
