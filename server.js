@@ -173,39 +173,40 @@ wss.on('connection', (ws) => {
             case 'create_vault':
                 const vaultId = crypto.randomUUID();
                 const vaultHash = crypto.randomBytes(16).toString('hex'); // Unique hash for joining
-                const rawVaultKey = Buffer.from(data.rawVaultKeyB64, 'base64'); // Raw AES key from client
-                const salt = Buffer.from(data.saltB64, 'base64'); // Salt from client
 
-                // Server encrypts the raw vault key using a key derived from the vaultHash
-                const derivedKeyForVaultKey = await deriveKeyFromHashServer(vaultHash, salt);
-                const ivForVaultKey = crypto.randomBytes(16); // IV for encrypting the vault key
-                const encryptedVaultKey = encryptDataServer(rawVaultKey, derivedKeyForVaultKey, ivForVaultKey);
+                // These are already encrypted by the client using a key derived from a temporary hash.
+                // The server's role is to store these encrypted components and the salt,
+                // and provide the server-generated vaultHash for future decryption by joiners.
+                const encryptedKeyB64FromClient = data.encryptedKeyB64;
+                const ivB64FromClient = data.ivB64;
+                const saltB64FromClient = data.saltB64; // This salt is used with the vaultHash to derive the key for decryption
 
                 vaults[vaultId] = {
                     name: data.vaultName,
                     type: data.vaultType,
                     expiration: data.expiration,
-                    adminId: currentUserId, // Admin for public vaults
-                    encryptedKeyB64: encryptedVaultKey.toString('base64'), // Store encrypted key
-                    ivB64: ivForVaultKey.toString('base64'), // Store IV for key encryption
-                    saltB64: salt.toString('base64'), // Store salt for key derivation
-                    used: data.vaultType === 'private' ? false : true, // Private hash used once
+                    adminId: currentUserId,
+                    encryptedKeyB64: encryptedKeyB64FromClient, // Store as received
+                    ivB64: ivB64FromClient, // Store as received
+                    saltB64: saltB64FromClient, // Store as received
+                    used: data.vaultType === 'private' ? false : true,
                     members: new Set([currentUserId]),
-                    createdAt: Date.now() // For expiration
+                    createdAt: Date.now()
                 };
                 saveData(VAULTS_FILE, vaults);
 
-                // Send back the vault details and the encrypted key to the creator
+                // Send back the vault details and the *same* encrypted key to the creator.
+                // The creator will use the server-generated vaultHash to decrypt their own vault key.
                 ws.send(JSON.stringify({
                     type: 'vault_created',
                     vaultId: vaultId,
-                    vaultHash: vaultHash,
+                    vaultHash: vaultHash, // This is the server-generated hash
                     vaultName: data.vaultName,
                     vaultType: data.vaultType,
                     expiration: data.expiration,
-                    encryptedKeyB64: encryptedVaultKey.toString('base64'),
-                    ivB64: ivForVaultKey.toString('base64'),
-                    saltB64: salt.toString('base64')
+                    encryptedKeyB64: encryptedKeyB64FromClient, // Send back what was received
+                    ivB64: ivB64FromClient, // Send back what was received
+                    saltB64: saltB64FromClient // Send back what was received
                 }));
                 console.log(`Vault ${vaultId} created by ${currentUserId}. Hash: ${vaultHash}`);
                 break;
@@ -256,7 +257,7 @@ wss.on('connection', (ws) => {
                         joinedVaultName: userVaultName, // Use the name given by the joiner
                         joinedVaultType: vault.type,
                         joinedExpiration: vault.expiration,
-                        encryptedKeyB64: vault.encryptedKeyB64, // Send the encrypted key
+                        encryptedKeyB66: vault.encryptedKeyB64, // Send the encrypted key
                         ivB64: vault.ivB64, // Send the IV for key encryption
                         saltB64: vault.saltB64, // Send the salt for key derivation
                         vaultHash: joinHash // Send the hash back so client can derive key
