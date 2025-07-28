@@ -38,7 +38,18 @@ function loadData(filePath, defaultData) {
     try {
         if (fs.existsSync(filePath)) {
             const data = fs.readFileSync(filePath, 'utf8');
-            return JSON.parse(data);
+            const parsedData = JSON.parse(data);
+            // Convert members arrays back to Sets if loaded from JSON
+            if (filePath === VAULTS_FILE) {
+                for (const vaultId in parsedData) {
+                    if (parsedData[vaultId].members && Array.isArray(parsedData[vaultId].members)) {
+                        parsedData[vaultId].members = new Set(parsedData[vaultId].members);
+                    } else {
+                        parsedData[vaultId].members = new Set(); // Ensure it's always a Set
+                    }
+                }
+            }
+            return parsedData;
         }
     } catch (error) {
         console.error(`Error loading data from ${filePath}:`, error.message);
@@ -53,7 +64,14 @@ function loadData(filePath, defaultData) {
  */
 function saveData(filePath, data) {
     try {
-        fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
+        // Convert Sets to Arrays for JSON serialization before saving
+        const serializableData = JSON.parse(JSON.stringify(data, (key, value) => {
+            if (value instanceof Set) {
+                return Array.from(value);
+            }
+            return value;
+        }));
+        fs.writeFileSync(filePath, JSON.stringify(serializableData, null, 2), 'utf8');
     } catch (error) {
         console.error(`Error saving data to ${filePath}:`, error.message);
     }
@@ -61,14 +79,6 @@ function saveData(filePath, data) {
 
 // Load initial data
 vaults = loadData(VAULTS_FILE, {});
-// Convert members arrays back to Sets if loaded from JSON
-for (const vaultId in vaults) {
-    if (vaults[vaultId].members) {
-        vaults[vaultId].members = new Set(vaults[vaultId].members);
-    } else {
-        vaults[vaultId].members = new Set();
-    }
-}
 offlineMessages = loadData(OFFLINE_MESSAGES_FILE, {});
 
 // --- Cryptography on Server (for vault key encryption/decryption) ---
@@ -131,7 +141,14 @@ wss.on('connection', (ws) => {
     let currentUserId = null; // Will be set after 'register' message
 
     ws.on('message', async (message) => {
-        const data = JSON.parse(message.toString());
+        let data;
+        try {
+            data = JSON.parse(message.toString());
+        } catch (e) {
+            console.error("Server: Failed to parse incoming WebSocket message:", e, message.toString());
+            ws.send(JSON.stringify({ type: 'error', message: 'Malformed message received.' }));
+            return;
+        }
         console.log('Received from client:', data.type, data.userId || '');
 
         if (data.type === 'register') {
@@ -181,6 +198,12 @@ wss.on('connection', (ws) => {
                 const ivB64FromClient = data.ivB64;
                 const saltB64FromClient = data.saltB64; // This salt is used with the vaultHash to derive the key for decryption
 
+                if (!encryptedKeyB64FromClient || !ivB64FromClient || !saltB64FromClient) {
+                    console.error("Server: Missing encrypted key components from client for create_vault.");
+                    ws.send(JSON.stringify({ type: 'error', message: 'Missing key components for vault creation.' }));
+                    return;
+                }
+
                 vaults[vaultId] = {
                     name: data.vaultName,
                     type: data.vaultType,
@@ -194,6 +217,8 @@ wss.on('connection', (ws) => {
                     createdAt: Date.now()
                 };
                 saveData(VAULTS_FILE, vaults);
+                console.log(`Server: Vault ${vaultId} saved to file.`);
+
 
                 // Send back the vault details and the *same* encrypted key to the creator.
                 // The creator will use the server-generated vaultHash to decrypt their own vault key.
@@ -208,7 +233,7 @@ wss.on('connection', (ws) => {
                     ivB64: ivB64FromClient, // Send back what was received
                     saltB64: saltB64FromClient // Send back what was received
                 }));
-                console.log(`Vault ${vaultId} created by ${currentUserId}. Hash: ${vaultHash}`);
+                console.log(`Server: Vault ${vaultId} created by ${currentUserId}. Hash: ${vaultHash}. Response sent to client.`);
                 break;
 
             case 'join_vault':
@@ -219,9 +244,15 @@ wss.on('connection', (ws) => {
                 for (const id in vaults) {
                     const vault = vaults[id];
                     // Re-derive the hash to compare (this is inefficient, but ensures hash is not stored directly)
+                    // Ensure saltB64, encryptedKeyB64, ivB64 exist before attempting decryption
+                    if (!vault.saltB64 || !vault.encryptedKeyB64 || !vault.ivB64) {
+                        console.warn(`Server: Skipping vault ${id} due to missing key components.`);
+                        continue;
+                    }
+
                     const tempSalt = Buffer.from(vault.saltB64, 'base64');
-                    const tempDerivedKey = await deriveKeyFromHashServer(joinHash, tempSalt);
                     try {
+                        const tempDerivedKey = await deriveKeyFromHashServer(joinHash, tempSalt);
                         // Attempt to decrypt the vault key with the provided hash
                         const tempDecryptedKey = decryptDataServer(
                             Buffer.from(vault.encryptedKeyB64, 'base64'),
@@ -233,6 +264,7 @@ wss.on('connection', (ws) => {
                         break;
                     } catch (e) {
                         // Decryption failed, not the correct hash or key
+                        console.log(`Server: Decryption failed for vault ${id} with provided hash.`, e.message);
                         continue;
                     }
                 }
@@ -249,6 +281,7 @@ wss.on('connection', (ws) => {
                         vault.used = true; // Mark hash as used for private vaults
                     }
                     saveData(VAULTS_FILE, vaults);
+                    console.log(`Server: Vault ${foundVaultId} members updated to file.`);
 
                     // Send the encrypted vault key and IV to the joiner
                     ws.send(JSON.stringify({
@@ -257,12 +290,12 @@ wss.on('connection', (ws) => {
                         joinedVaultName: userVaultName, // Use the name given by the joiner
                         joinedVaultType: vault.type,
                         joinedExpiration: vault.expiration,
-                        encryptedKeyB66: vault.encryptedKeyB64, // Send the encrypted key
+                        encryptedKeyB64: vault.encryptedKeyB64, // Send the encrypted key
                         ivB64: vault.ivB64, // Send the IV for key encryption
                         saltB64: vault.saltB64, // Send the salt for key derivation
                         vaultHash: joinHash // Send the hash back so client can derive key
                     }));
-                    console.log(`User ${currentUserId} joined vault ${foundVaultId}.`);
+                    console.log(`Server: User ${currentUserId} joined vault ${foundVaultId}. Response sent.`);
 
                     // Send any pending offline messages for this vault to the new member
                     if (offlineMessages[currentUserId]) {
@@ -275,11 +308,13 @@ wss.on('connection', (ws) => {
                                 delete offlineMessages[currentUserId];
                             }
                             saveData(OFFLINE_MESSAGES_FILE, offlineMessages);
+                            console.log(`Server: Sent ${relevantMessages.length} offline messages to ${currentUserId} for vault ${foundVaultId}.`);
                         }
                     }
 
                 } else {
                     ws.send(JSON.stringify({ type: 'error', message: 'Vault not found or hash is incorrect/expired.' }));
+                    console.log(`Server: Join vault failed for ${currentUserId}. Hash: ${joinHash}.`);
                 }
                 break;
 
@@ -312,12 +347,13 @@ wss.on('connection', (ws) => {
                                 }
                                 offlineMessages[memberId].push(messageToSend);
                                 saveData(OFFLINE_MESSAGES_FILE, offlineMessages);
-                                console.log(`Stored offline text message for ${memberId} in vault ${msgVaultId}`);
+                                console.log(`Server: Stored offline text message for ${memberId} in vault ${msgVaultId}`);
                             }
                         }
                     });
                 } else {
                     ws.send(JSON.stringify({ type: 'error', message: 'Vault not found or you are not a member.' }));
+                    console.log(`Server: Message send failed for ${senderId} in vault ${msgVaultId}.`);
                 }
                 break;
 
@@ -359,12 +395,13 @@ wss.on('connection', (ws) => {
                                 }
                                 offlineMessages[memberId].push(fileMetadataToSend);
                                 saveData(OFFLINE_MESSAGES_FILE, offlineMessages);
-                                console.log(`Stored offline file metadata for ${memberId} (file: ${fileId})`);
+                                console.log(`Server: Stored offline file metadata for ${memberId} (file: ${fileId})`);
                             }
                         }
                     });
                 } else {
                     ws.send(JSON.stringify({ type: 'error', message: 'Vault not found or you are not a member for file metadata.' }));
+                    console.log(`Server: File metadata send failed for ${fileMetaSenderId} in vault ${fileMetaVaultId}.`);
                 }
                 break;
 
@@ -406,18 +443,19 @@ wss.on('connection', (ws) => {
                                 }
                                 offlineMessages[memberId].push(fileChunkToSend);
                                 saveData(OFFLINE_MESSAGES_FILE, offlineMessages);
-                                console.log(`Stored offline file chunk ${chunkIndex} for ${memberId} (file: ${chunkFileId})`);
+                                console.log(`Server: Stored offline file chunk ${chunkIndex} for ${memberId} (file: ${chunkFileId})`);
                             }
                         }
                     });
                 } else {
                     ws.send(JSON.stringify({ type: 'error', message: 'Vault not found or you are not a member for file chunk.' }));
+                    console.log(`Server: File chunk send failed for ${fileChunkSenderId} in vault ${fileChunkVaultId}.`);
                 }
                 break;
 
             case 'nuke':
                 const nukeUserId = data.userId;
-                console.log(`Nuke request received for user: ${nukeUserId}`);
+                console.log(`Server: Nuke request received for user: ${nukeUserId}`);
 
                 // Remove user from all vaults
                 for (const id in vaults) {
@@ -425,30 +463,34 @@ wss.on('connection', (ws) => {
                         vaults[id].members.delete(nukeUserId);
                         // If a private vault becomes empty, consider deleting it or marking it for deletion
                         if (vaults[id].type === 'private' && vaults[id].members.size === 0) {
-                            console.log(`Private vault ${id} is now empty after nuke, marking for deletion.`);
+                            console.log(`Server: Private vault ${id} is now empty after nuke, marking for deletion.`);
                             // We can set a flag or short expiration to clean up empty private vaults
                             // For this demo, we'll just leave it empty until its natural expiration
                         }
                     }
                 }
                 saveData(VAULTS_FILE, vaults);
+                console.log(`Server: Vaults updated after nuke for ${nukeUserId}.`);
 
                 // Clear offline messages for this user
                 if (offlineMessages[nukeUserId]) {
                     delete offlineMessages[nukeUserId];
                     saveData(OFFLINE_MESSAGES_FILE, offlineMessages);
+                    console.log(`Server: Offline messages cleared for ${nukeUserId}.`);
                 }
 
                 // Disconnect the client
                 if (connectedClients[nukeUserId]) {
                     connectedClients[nukeUserId].close();
                     delete connectedClients[nukeUserId];
+                    console.log(`Server: User ${nukeUserId} disconnected by nuke request.`);
                 }
-                console.log(`User ${nukeUserId} data nuked from server.`);
+                console.log(`Server: User ${nukeUserId} data nuked from server.`);
                 break;
 
             default:
                 ws.send(JSON.stringify({ type: 'error', message: 'Unknown message type.' }));
+                console.log(`Server: Unknown message type received: ${data.type}`);
                 break;
         }
     });
@@ -456,12 +498,12 @@ wss.on('connection', (ws) => {
     ws.on('close', () => {
         if (currentUserId) {
             delete connectedClients[currentUserId];
-            console.log(`User ${currentUserId} disconnected.`);
+            console.log(`Server: User ${currentUserId} disconnected.`);
         }
     });
 
     ws.on('error', (error) => {
-        console.error('WebSocket error:', error);
+        console.error('Server: WebSocket error:', error);
     });
 });
 
@@ -486,7 +528,7 @@ function checkVaultExpirations() {
         }
 
         if (vault.createdAt + expirationTimeMs < now) {
-            console.log(`Vault ${vault.name} (${vaultId}) has expired. Deleting.`);
+            console.log(`Server: Vault ${vault.name} (${vaultId}) has expired. Deleting.`);
             // Notify members before deleting
             vault.members.forEach(memberId => {
                 const memberWs = connectedClients[memberId];
@@ -512,6 +554,7 @@ function checkVaultExpirations() {
     if (changed) {
         saveData(VAULTS_FILE, vaults);
         saveData(OFFLINE_MESSAGES_FILE, offlineMessages); // Save updated offline messages
+        console.log("Server: Expired vaults and associated offline messages cleaned up.");
     }
 }
 
