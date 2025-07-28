@@ -141,10 +141,27 @@ wss.on('connection', (ws) => {
 
             // Send any pending offline messages to the newly connected user
             if (offlineMessages[currentUserId] && offlineMessages[currentUserId].length > 0) {
-                ws.send(JSON.stringify({ type: 'offline_messages', messages: offlineMessages[currentUserId] }));
-                delete offlineMessages[currentUserId]; // Clear after sending
-                saveData(OFFLINE_MESSAGES_FILE, offlineMessages);
-                console.log(`Sent ${offlineMessages[currentUserId]?.length || 0} offline messages to ${currentUserId}`);
+                // Filter out any potential duplicate messages if a client reconnects quickly
+                const uniqueOfflineMessages = offlineMessages[currentUserId].filter((msg, index, self) =>
+                    index === self.findIndex((m) => (
+                        m.vaultId === msg.vaultId &&
+                        m.senderId === msg.senderId &&
+                        m.timestamp === msg.timestamp &&
+                        m.type === msg.type && // Important for distinguishing metadata/chunks
+                        m.fileId === msg.fileId && // Important for distinguishing file parts
+                        m.chunkIndex === msg.chunkIndex // Important for distinguishing file parts
+                    ))
+                );
+
+                if (uniqueOfflineMessages.length > 0) {
+                    ws.send(JSON.stringify({ type: 'offline_messages', messages: uniqueOfflineMessages }));
+                    // Clear after sending - only remove the messages that were actually sent
+                    // For simplicity in this demo, we clear all for the user.
+                    // In production, you'd track which messages were successfully delivered.
+                    delete offlineMessages[currentUserId];
+                    saveData(OFFLINE_MESSAGES_FILE, offlineMessages);
+                    console.log(`Sent ${uniqueOfflineMessages.length} offline messages to ${currentUserId}`);
+                }
             }
         } else if (!currentUserId) {
             // Reject messages if user is not registered yet
@@ -201,8 +218,6 @@ wss.on('connection', (ws) => {
                 for (const id in vaults) {
                     const vault = vaults[id];
                     // Re-derive the hash to compare (this is inefficient, but ensures hash is not stored directly)
-                    // A better way would be to store a hash of the hash, or have a separate lookup table.
-                    // For this demo, we'll iterate and check.
                     const tempSalt = Buffer.from(vault.saltB64, 'base64');
                     const tempDerivedKey = await deriveKeyFromHashServer(joinHash, tempSalt);
                     try {
@@ -267,19 +282,19 @@ wss.on('connection', (ws) => {
                 }
                 break;
 
-            case 'send_message':
+            case 'send_message': // Handles text messages
                 const { vaultId: msgVaultId, senderId, encryptedMessage, iv, timestamp, isFile, fileName, fileMimeType } = data;
                 const vault = vaults[msgVaultId];
 
                 if (vault && vault.members.has(senderId)) {
                     const messageToSend = {
-                        type: 'new_message',
+                        type: 'new_message', // This type is for text messages
                         vaultId: msgVaultId,
                         senderId: senderId,
                         encryptedMessage: encryptedMessage, // Server only relays encrypted content
                         iv: iv,
                         timestamp: timestamp,
-                        isFile: isFile,
+                        isFile: isFile, // Should be false for this type
                         fileName: fileName,
                         fileMimeType: fileMimeType
                     };
@@ -296,12 +311,106 @@ wss.on('connection', (ws) => {
                                 }
                                 offlineMessages[memberId].push(messageToSend);
                                 saveData(OFFLINE_MESSAGES_FILE, offlineMessages);
-                                console.log(`Stored offline message for ${memberId} in vault ${msgVaultId}`);
+                                console.log(`Stored offline text message for ${memberId} in vault ${msgVaultId}`);
                             }
                         }
                     });
                 } else {
                     ws.send(JSON.stringify({ type: 'error', message: 'Vault not found or you are not a member.' }));
+                }
+                break;
+
+            case 'send_file_metadata':
+                const {
+                    vaultId: fileMetaVaultId,
+                    senderId: fileMetaSenderId,
+                    fileId,
+                    fileName: fileMetaName,
+                    fileMimeType: fileMetaMimeType,
+                    fileSize,
+                    totalChunks,
+                    timestamp: fileMetaTimestamp
+                } = data;
+
+                const fileMetaVault = vaults[fileMetaVaultId];
+
+                if (fileMetaVault && fileMetaVault.members.has(fileMetaSenderId)) {
+                    const fileMetadataToSend = {
+                        type: 'send_file_metadata', // Relay this specific type
+                        vaultId: fileMetaVaultId,
+                        senderId: fileMetaSenderId,
+                        fileId: fileId,
+                        fileName: fileMetaName,
+                        fileMimeType: fileMetaMimeType,
+                        fileSize: fileSize,
+                        totalChunks: totalChunks,
+                        timestamp: fileMetaTimestamp
+                    };
+
+                    fileMetaVault.members.forEach(memberId => {
+                        if (memberId !== fileMetaSenderId) {
+                            const recipientWs = connectedClients[memberId];
+                            if (recipientWs && recipientWs.readyState === WebSocket.OPEN) {
+                                recipientWs.send(JSON.stringify(fileMetadataToSend));
+                            } else {
+                                if (!offlineMessages[memberId]) {
+                                    offlineMessages[memberId] = [];
+                                }
+                                offlineMessages[memberId].push(fileMetadataToSend);
+                                saveData(OFFLINE_MESSAGES_FILE, offlineMessages);
+                                console.log(`Stored offline file metadata for ${memberId} (file: ${fileId})`);
+                            }
+                        }
+                    });
+                } else {
+                    ws.send(JSON.stringify({ type: 'error', message: 'Vault not found or you are not a member for file metadata.' }));
+                }
+                break;
+
+            case 'send_file_chunk':
+                const {
+                    vaultId: fileChunkVaultId,
+                    senderId: fileChunkSenderId,
+                    fileId: chunkFileId,
+                    chunkIndex,
+                    encryptedChunk, // This contains the combined header+IV+ciphertext
+                    timestamp: fileChunkTimestamp,
+                    fileName: fileChunkName, // Included for offline message clarity
+                    fileMimeType: fileChunkMimeType // Included for offline message clarity
+                } = data;
+
+                const fileChunkVault = vaults[fileChunkVaultId];
+
+                if (fileChunkVault && fileChunkVault.members.has(fileChunkSenderId)) {
+                    const fileChunkToSend = {
+                        type: 'send_file_chunk', // Relay this specific type
+                        vaultId: fileChunkVaultId,
+                        senderId: fileChunkSenderId,
+                        fileId: chunkFileId,
+                        chunkIndex: chunkIndex,
+                        encryptedChunk: encryptedChunk,
+                        timestamp: fileChunkTimestamp,
+                        fileName: fileChunkName,
+                        fileMimeType: fileChunkMimeType
+                    };
+
+                    fileChunkVault.members.forEach(memberId => {
+                        if (memberId !== fileChunkSenderId) {
+                            const recipientWs = connectedClients[memberId];
+                            if (recipientWs && recipientWs.readyState === WebSocket.OPEN) {
+                                recipientWs.send(JSON.stringify(fileChunkToSend));
+                            } else {
+                                if (!offlineMessages[memberId]) {
+                                    offlineMessages[memberId] = [];
+                                }
+                                offlineMessages[memberId].push(fileChunkToSend);
+                                saveData(OFFLINE_MESSAGES_FILE, offlineMessages);
+                                console.log(`Stored offline file chunk ${chunkIndex} for ${memberId} (file: ${chunkFileId})`);
+                            }
+                        }
+                    });
+                } else {
+                    ws.send(JSON.stringify({ type: 'error', message: 'Vault not found or you are not a member for file chunk.' }));
                 }
                 break;
 
