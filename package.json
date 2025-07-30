@@ -1,7 +1,7 @@
- {
+{
   "name": "the-platform-server",
   "version": "1.1.0",
-  "description": "Node.js relay server for The Platform with enhanced Kyber encryption",
+  "description": "Node.js relay server with enhanced Kyber encryption",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
