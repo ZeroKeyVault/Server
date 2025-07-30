@@ -1,7 +1,7 @@
-{
+ {
   "name": "the-platform-server",
-  "version": "1.0.0",
-  "description": "Node.js relay server for The Platform private messaging app.",
+  "version": "1.1.0",
+  "description": "Node.js relay server for The Platform with enhanced Kyber encryption",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -9,14 +9,15 @@
   "keywords": [
     "websocket",
     "chat",
-    "relay",
-    "privacy",
-    "p2p"
+    "kyber",
+    "post-quantum",
+    "encryption"
   ],
   "author": "Prakhar Solanki",
   "license": "ISC",
   "dependencies": {
     "express": "^4.19.2",
-    "ws": "^8.18.0"
+    "ws": "^8.18.0",
+    "kyber-crystals": "^1.0.5"
   }
 }
