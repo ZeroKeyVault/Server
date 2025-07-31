@@ -534,7 +534,7 @@ wss.on('connection', (ws) => {
                     if (messageVault && messageVault.members.has(data.senderId)) {
                         const messageToSend = {
                             type: 'new_message',
-                            vaultId: data.vaultId,
+                            vaultId: 'data.vaultId',
                             senderId: data.senderId,
                             encryptedMessage: data.encryptedMessage,
                             iv: data.iv,
