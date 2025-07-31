@@ -4,40 +4,31 @@ const http = require('http');
 const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
-const crypto = require('crypto');
-const kyber768 = require('@pqcrypto/kyber768'); // CRYSTALS-Kyber implementation for post-quantum security
+const crypto = require('crypto'); // Node.js crypto module for key derivation
 
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 const PORT = process.env.PORT || 3000;
 
-// --- Production-Ready Server Configuration ---
-// Security headers for production
-app.use((req, res, next) => {
-    res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';");
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('X-Frame-Options', 'DENY');
-    res.setHeader('X-XSS-Protection', '1; mode=block');
-    next();
-});
-
-// --- Server-side Data Storage (Production-Ready) ---
+// --- Server-side Data Storage (Simple JSON files for demo) ---
+// In a production environment, use a robust database (e.g., PostgreSQL, MongoDB)
+// and proper authentication/authorization.
 const DATA_DIR = path.join(__dirname, 'data');
 const VAULTS_FILE = path.join(DATA_DIR, 'vaults.json');
 const OFFLINE_MESSAGES_FILE = path.join(DATA_DIR, 'offline_messages.json');
 
-// Ensure data directory exists with proper permissions
+// Ensure data directory exists
 if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { mode: 0o700 }); // Restricted permissions
+    fs.mkdirSync(DATA_DIR);
 }
 
-let vaults = {}; // vaultId -> { name, type, expiration, adminId, publicKey, used, members: Set<userId> }
+let vaults = {}; // vaultId -> { name, type, expiration, adminId, encryptedKeyB64, ivB64, saltB64, used (for private), members: Set<userId> }
 let offlineMessages = {}; // userId -> [{ vaultId, senderId, encryptedMessage, iv, timestamp, isFile, fileName, fileMimeType }]
 let connectedClients = {}; // userId -> WebSocket
 
 /**
- * Loads data from a JSON file with proper error handling.
+ * Loads data from a JSON file.
  * @param {string} filePath - Path to the JSON file.
  * @param {object} defaultData - Default data if file doesn't exist or is empty.
  * @returns {object} Parsed data.
@@ -55,16 +46,13 @@ function loadData(filePath, defaultData) {
 }
 
 /**
- * Saves data to a JSON file with proper error handling and atomic writes.
+ * Saves data to a JSON file.
  * @param {string} filePath - Path to the JSON file.
  * @param {object} data - Data to save.
  */
 function saveData(filePath, data) {
     try {
-        // Use atomic write to prevent data corruption
-        const tempPath = `${filePath}.tmp`;
-        fs.writeFileSync(tempPath, JSON.stringify(data, null, 2), 'utf8');
-        fs.renameSync(tempPath, filePath);
+        fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
     } catch (error) {
         console.error(`Error saving data to ${filePath}:`, error.message);
     }
@@ -82,9 +70,14 @@ for (const vaultId in vaults) {
 }
 offlineMessages = loadData(OFFLINE_MESSAGES_FILE, {});
 
-// --- Production-Ready Cryptography on Server ---
+// --- Cryptography on Server (for vault key encryption/decryption) ---
+// This part is crucial for "The Laughing Buddha Protocol" to ensure the server
+// never sees the plaintext vault keys or messages.
+
 /**
  * Derives a cryptographic key from a given password (hash) using PBKDF2.
+ * This is used to encrypt/decrypt the vault's main AES key.
+ * Server-side equivalent of client's deriveKeyFromHash.
  * @param {string} password - The vault hash (password).
  * @param {Buffer} salt - A unique salt for key derivation.
  * @returns {Promise<Buffer>} The derived key.
@@ -129,40 +122,9 @@ function decryptDataServer(encryptedDataWithTag, key, iv) {
     return decrypted;
 }
 
-/**
- * Securely wipes sensitive data from memory
- * @param {Buffer|Uint8Array} data - The data to wipe
- */
-function secureWipe(data) {
-    if (!data) return;
-    
-    // Fill with random data first
-    crypto.randomFillSync(data);
-    
-    // Then fill with zeros
-    data.fill(0);
-}
-
-/**
- * Derives an AES key from Kyber shared secret using HKDF
- * @param {Buffer} sharedSecret - The Kyber shared secret
- * @returns {Buffer} The derived AES key
- */
-function deriveAesKeyFromKyber(sharedSecret) {
-    try {
-        const hkdf = crypto.createHmac('sha256', 'KyberVaultKey');
-        hkdf.update(sharedSecret);
-        return hkdf.digest();
-    } catch (error) {
-        console.error("Failed to derive AES key from Kyber shared secret:", error);
-        throw new Error("Failed to establish secure communication channel.");
-    }
-}
-
-// --- Production-Ready WebSocket Server Logic ---
+// --- WebSocket Server Logic ---
 wss.on('connection', (ws) => {
-    let currentUserId = null;
-    
+    let currentUserId = null; // Will be set after 'register' message
     ws.on('message', async (message) => {
         let data;
         try {
@@ -177,14 +139,6 @@ wss.on('connection', (ws) => {
         
         console.log('Received from client:', data.type, data.userId || '');
         
-        // Validate message structure
-        if (!data.type) {
-            if (ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: 'error', message: 'Missing message type' }));
-            }
-            return;
-        }
-        
         if (data.type === 'register') {
             if (!data.userId || typeof data.userId !== 'string') {
                 if (ws.readyState === WebSocket.OPEN) {
@@ -197,19 +151,17 @@ wss.on('connection', (ws) => {
             connectedClients[currentUserId] = ws;
             console.log(`User ${currentUserId} connected.`);
             
-            // Send any pending offline messages
+            // Send any pending offline messages to the newly connected user
             if (offlineMessages[currentUserId] && offlineMessages[currentUserId].length > 0) {
                 if (ws.readyState === WebSocket.OPEN) {
-                    ws.send(JSON.stringify({ 
-                        type: 'offline_messages', 
-                        messages: offlineMessages[currentUserId] 
-                    }));
+                    ws.send(JSON.stringify({ type: 'offline_messages', messages: offlineMessages[currentUserId] }));
                 }
-                delete offlineMessages[currentUserId];
+                delete offlineMessages[currentUserId]; // Clear after sending
                 saveData(OFFLINE_MESSAGES_FILE, offlineMessages);
                 console.log(`Sent ${offlineMessages[currentUserId]?.length || 0} offline messages to ${currentUserId}`);
             }
         } else if (!currentUserId) {
+            // Reject messages if user is not registered yet
             if (ws.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify({ type: 'error', message: 'Please register your user ID first.' }));
             }
@@ -219,7 +171,7 @@ wss.on('connection', (ws) => {
         try {
             switch (data.type) {
                 case 'create_private_vault':
-                    // Production security: Validate input
+                    // Validate input
                     if (!data.vaultName || !data.expiration || !data.vaultHash || !data.publicKey) {
                         if (ws.readyState === WebSocket.OPEN) {
                             ws.send(JSON.stringify({ 
@@ -261,7 +213,7 @@ wss.on('connection', (ws) => {
                     break;
                     
                 case 'request_join_private_vault':
-                    // Production security: Validate input
+                    // Validate input
                     if (!data.vaultHash || !data.vaultName) {
                         if (ws.readyState === WebSocket.OPEN) {
                             ws.send(JSON.stringify({ 
@@ -325,7 +277,7 @@ wss.on('connection', (ws) => {
                     break;
                     
                 case 'submit_private_vault_key':
-                    // Production security: Validate input
+                    // Validate input
                     if (!data.vaultId || !data.ciphertext || !data.encryptedVaultKey || !data.iv) {
                         if (ws.readyState === WebSocket.OPEN) {
                             ws.send(JSON.stringify({ 
@@ -336,10 +288,10 @@ wss.on('connection', (ws) => {
                         return;
                     }
                     
-                    const vault = vaults[data.vaultId];
-                    if (vault && vault.type === 'private') {
+                    const targetVault = vaults[data.vaultId];
+                    if (targetVault && targetVault.type === 'private') {
                         // Forward the data to the creator
-                        const creatorWs = connectedClients[vault.adminId];
+                        const creatorWs = connectedClients[targetVault.adminId];
                         if (creatorWs && creatorWs.readyState === WebSocket.OPEN) {
                             creatorWs.send(JSON.stringify({
                                 type: 'private_vault_key',
@@ -350,10 +302,10 @@ wss.on('connection', (ws) => {
                             }));
                         } else {
                             // Store for offline delivery
-                            if (!offlineMessages[vault.adminId]) {
-                                offlineMessages[vault.adminId] = [];
+                            if (!offlineMessages[targetVault.adminId]) {
+                                offlineMessages[targetVault.adminId] = [];
                             }
-                            offlineMessages[vault.adminId].push({
+                            offlineMessages[targetVault.adminId].push({
                                 type: 'private_vault_key',
                                 vaultId: data.vaultId,
                                 ciphertext: data.ciphertext,
@@ -366,7 +318,7 @@ wss.on('connection', (ws) => {
                     break;
                     
                 case 'create_vault':
-                    // Production security: Validate input
+                    // Validate input
                     if (!data.vaultName || !data.vaultType || !data.expiration || 
                         !data.rawVaultKeyB64 || !data.saltB64) {
                         if (ws.readyState === WebSocket.OPEN) {
@@ -420,7 +372,7 @@ wss.on('connection', (ws) => {
                     break;
                     
                 case 'join_vault':
-                    // Production security: Validate input
+                    // Validate input
                     if (!data.vaultHash || !data.vaultName) {
                         if (ws.readyState === WebSocket.OPEN) {
                             ws.send(JSON.stringify({ 
@@ -514,7 +466,7 @@ wss.on('connection', (ws) => {
                     break;
                     
                 case 'send_message':
-                    // Production security: Validate input
+                    // Validate input
                     if (!data.vaultId || !data.senderId || !data.encryptedMessage || 
                         !data.iv || !data.timestamp) {
                         if (ws.readyState === WebSocket.OPEN) {
@@ -526,8 +478,8 @@ wss.on('connection', (ws) => {
                         return;
                     }
                     
-                    const vault = vaults[data.vaultId];
-                    if (vault && vault.members.has(data.senderId)) {
+                    const messageVault = vaults[data.vaultId];
+                    if (messageVault && messageVault.members.has(data.senderId)) {
                         const messageToSend = {
                             type: 'new_message',
                             vaultId: data.vaultId,
@@ -539,7 +491,7 @@ wss.on('connection', (ws) => {
                             fileName: data.fileName || null,
                             fileMimeType: data.fileMimeType || null
                         };
-                        vault.members.forEach(memberId => {
+                        messageVault.members.forEach(memberId => {
                             if (memberId !== data.senderId) {
                                 const recipientWs = connectedClients[memberId];
                                 if (recipientWs && recipientWs.readyState === WebSocket.OPEN) {
@@ -634,7 +586,7 @@ wss.on('connection', (ws) => {
     });
 });
 
-// --- Production-Ready Vault Expiration Logic ---
+// --- Vault Expiration Logic ---
 function checkVaultExpirations() {
     const now = Date.now();
     let changed = false;
@@ -708,26 +660,7 @@ function checkVaultExpirations() {
 // Check expirations every minute
 setInterval(checkVaultExpirations, 60 * 1000);
 
-// --- Production-Ready Health Check and Metrics ---
-app.get('/health', (req, res) => {
-    const health = {
-        status: 'healthy',
-        timestamp: new Date().toISOString(),
-        uptime: process.uptime(),
-        memoryUsage: process.memoryUsage(),
-        activeConnections: Object.keys(connectedClients).length,
-        vaultCount: Object.keys(vaults).length
-    };
-    
-    // Basic security: Don't expose too much detail in production
-    if (process.env.NODE_ENV === 'production') {
-        delete health.memoryUsage;
-    }
-    
-    res.status(200).json(health);
-});
-
-// --- Basic HTTP Server for Production ---
+// --- Basic HTTP Server for Health Check (for Render) ---
 app.get('/', (req, res) => {
     res.send(`
         <!DOCTYPE html>
@@ -744,7 +677,7 @@ app.get('/', (req, res) => {
         <body>
             <div class="header">
                 <h1>The Platform Server</h1>
-                <p>Secure post-quantum messaging relay server</p>
+                <p>Secure messaging relay server</p>
             </div>
             
             <div class="info">
@@ -764,20 +697,24 @@ app.get('/', (req, res) => {
     `);
 });
 
-// --- Production-Ready Server Startup ---
+// Health check endpoint
+app.get('/health', (req, res) => {
+    const health = {
+        status: 'healthy',
+        timestamp: new Date().toISOString(),
+        uptime: process.uptime(),
+        memoryUsage: process.memoryUsage(),
+        activeConnections: Object.keys(connectedClients).length,
+        vaultCount: Object.keys(vaults).length
+    };
+    
+    res.status(200).json(health);
+});
+
 server.listen(PORT, () => {
     console.log(`Server listening on port ${PORT}`);
-    console.log("Kyber post-quantum encryption is now active for private vaults");
+    console.log("The Platform Server is running");
     
     // Initial expiration check on startup
     checkVaultExpirations();
-    
-    // Log startup information securely
-    console.log(`Server environment: ${process.env.NODE_ENV || 'development'}`);
-    console.log(`Server PID: ${process.pid}`);
-    
-    // Security notice
-    if (process.env.NODE_ENV === 'production') {
-        console.log("Running in PRODUCTION mode with enhanced security settings");
-    }
 });
