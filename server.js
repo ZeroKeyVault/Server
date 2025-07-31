@@ -23,7 +23,7 @@ if (!fs.existsSync(DATA_DIR)) {
     fs.mkdirSync(DATA_DIR);
 }
 
-let vaults = {}; // vaultId -> { name, type, expiration, adminId, encryptedKeyB64, ivB64, saltB64, used (for private), members: Set<userId> }
+let vaults = {}; // vaultId -> { name, type, expiration, adminId, vaultHash (for private), encryptedKeyB64 (for public), ivB64, saltB64, used (for private), members: Set<userId> }
 let offlineMessages = {}; // userId -> [{ vaultId, senderId, encryptedMessage, iv, timestamp, isFile, fileName, fileMimeType }]
 let connectedClients = {}; // userId -> WebSocket
 
@@ -319,8 +319,7 @@ wss.on('connection', (ws) => {
                     
                 case 'create_vault':
                     // Validate input
-                    if (!data.vaultName || !data.vaultType || !data.expiration || 
-                        !data.rawVaultKeyB64 || !data.saltB64) {
+                    if (!data.vaultName || !data.vaultType || !data.expiration) {
                         if (ws.readyState === WebSocket.OPEN) {
                             ws.send(JSON.stringify({ 
                                 type: 'error', 
@@ -330,45 +329,88 @@ wss.on('connection', (ws) => {
                         return;
                     }
                     
-                    const publicVaultId = crypto.randomUUID();
-                    const vaultHash = crypto.randomBytes(16).toString('hex');
-                    const rawVaultKey = Buffer.from(data.rawVaultKeyB64, 'base64');
-                    const salt = Buffer.from(data.saltB64, 'base64');
-                    
-                    // Server encrypts the raw vault key using a key derived from the vaultHash
-                    const derivedKeyForVaultKey = await deriveKeyFromHashServer(vaultHash, salt);
-                    const ivForVaultKey = crypto.randomBytes(16);
-                    const encryptedVaultKey = encryptDataServer(rawVaultKey, derivedKeyForVaultKey, ivForVaultKey);
-                    
-                    vaults[publicVaultId] = {
-                        name: data.vaultName,
-                        type: data.vaultType,
-                        expiration: data.expiration,
-                        adminId: currentUserId,
-                        encryptedKeyB64: encryptedVaultKey.toString('base64'),
-                        ivB64: ivForVaultKey.toString('base64'),
-                        saltB64: salt.toString('base64'),
-                        used: data.vaultType === 'private' ? false : true,
-                        members: new Set([currentUserId]),
-                        createdAt: Date.now()
-                    };
-                    saveData(VAULTS_FILE, vaults);
-                    
-                    if (ws.readyState === WebSocket.OPEN) {
-                        ws.send(JSON.stringify({
-                            type: 'vault_created',
-                            vaultId: publicVaultId,
-                            vaultHash: vaultHash,
-                            vaultName: data.vaultName,
-                            vaultType: data.vaultType,
+                    if (data.vaultType === 'private') {
+                        let vaultHash = data.vaultHash || crypto.randomBytes(16).toString('hex');
+                        const vaultId = crypto.randomUUID();
+                        
+                        vaults[vaultId] = {
+                            name: data.vaultName,
+                            type: 'private',
                             expiration: data.expiration,
+                            adminId: currentUserId,
+                            vaultHash: vaultHash,
+                            used: false,
+                            members: new Set([currentUserId]),
+                            createdAt: Date.now()
+                        };
+                        
+                        saveData(VAULTS_FILE, vaults);
+                        
+                        if (ws.readyState === WebSocket.OPEN) {
+                            ws.send(JSON.stringify({
+                                type: 'vault_created',
+                                vaultId: vaultId,
+                                vaultHash: vaultHash,
+                                vaultName: data.vaultName,
+                                vaultType: data.vaultType,
+                                expiration: data.expiration
+                            }));
+                        }
+                        
+                        console.log(`Private vault ${vaultId} created by ${currentUserId}. Hash: ${vaultHash}`);
+                    } else {
+                        // Public vault creation
+                        if (!data.rawVaultKeyB64 || !data.saltB64) {
+                            if (ws.readyState === WebSocket.OPEN) {
+                                ws.send(JSON.stringify({ 
+                                    type: 'error', 
+                                    message: 'Missing rawVaultKeyB64 or saltB64 for public vault creation' 
+                                }));
+                            }
+                            return;
+                        }
+                        
+                        const vaultId = crypto.randomUUID();
+                        const vaultHash = crypto.randomBytes(16).toString('hex');
+                        const rawVaultKey = Buffer.from(data.rawVaultKeyB64, 'base64');
+                        const salt = Buffer.from(data.saltB64, 'base64');
+                        
+                        // Encrypt the raw vault key using a key derived from the vaultHash
+                        const derivedKeyForVaultKey = await deriveKeyFromHashServer(vaultHash, salt);
+                        const ivForVaultKey = crypto.randomBytes(16);
+                        const encryptedVaultKey = encryptDataServer(rawVaultKey, derivedKeyForVaultKey, ivForVaultKey);
+                        
+                        vaults[vaultId] = {
+                            name: data.vaultName,
+                            type: data.vaultType,
+                            expiration: data.expiration,
+                            adminId: currentUserId,
                             encryptedKeyB64: encryptedVaultKey.toString('base64'),
                             ivB64: ivForVaultKey.toString('base64'),
-                            saltB64: salt.toString('base64')
-                        }));
+                            saltB64: salt.toString('base64'),
+                            used: true,
+                            members: new Set([currentUserId]),
+                            createdAt: Date.now()
+                        };
+                        
+                        saveData(VAULTS_FILE, vaults);
+                        
+                        if (ws.readyState === WebSocket.OPEN) {
+                            ws.send(JSON.stringify({
+                                type: 'vault_created',
+                                vaultId: vaultId,
+                                vaultHash: vaultHash,
+                                vaultName: data.vaultName,
+                                vaultType: data.vaultType,
+                                expiration: data.expiration,
+                                encryptedKeyB64: encryptedVaultKey.toString('base64'),
+                                ivB64: ivForVaultKey.toString('base64'),
+                                saltB64: salt.toString('base64')
+                            }));
+                        }
+                        
+                        console.log(`Public vault ${vaultId} created by ${currentUserId}. Hash: ${vaultHash}`);
                     }
-                    
-                    console.log(`Vault ${publicVaultId} created by ${currentUserId}. Hash: ${vaultHash}`);
                     break;
                     
                 case 'join_vault':
@@ -383,28 +425,41 @@ wss.on('connection', (ws) => {
                         return;
                     }
                     
-                    let foundPublicVaultId = null;
+                    let foundVaultId = null;
                     
-                    // Find the vault by hash
+                    // First, check for private vaults with matching hash
                     for (const id in vaults) {
                         const vault = vaults[id];
-                        const tempSalt = Buffer.from(vault.saltB64, 'base64');
-                        const tempDerivedKey = await deriveKeyFromHashServer(data.vaultHash, tempSalt);
-                        try {
-                            decryptDataServer(
-                                Buffer.from(vault.encryptedKeyB64, 'base64'),
-                                tempDerivedKey,
-                                Buffer.from(vault.ivB64, 'base64')
-                            );
-                            foundPublicVaultId = id;
+                        if (vault.type === 'private' && vault.vaultHash === data.vaultHash) {
+                            foundVaultId = id;
                             break;
-                        } catch (e) {
-                            continue;
                         }
                     }
                     
-                    if (foundPublicVaultId) {
-                        const vault = vaults[foundPublicVaultId];
+                    // If not found, check for public vaults by trying to decrypt
+                    if (!foundVaultId) {
+                        for (const id in vaults) {
+                            const vault = vaults[id];
+                            if (vault.type === 'public') {
+                                const tempSalt = Buffer.from(vault.saltB64, 'base64');
+                                const tempDerivedKey = await deriveKeyFromHashServer(data.vaultHash, tempSalt);
+                                try {
+                                    decryptDataServer(
+                                        Buffer.from(vault.encryptedKeyB64, 'base64'),
+                                        tempDerivedKey,
+                                        Buffer.from(vault.ivB64, 'base64')
+                                    );
+                                    foundVaultId = id;
+                                    break;
+                                } catch (e) {
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    
+                    if (foundVaultId) {
+                        const vault = vaults[foundVaultId];
                         if (vault.type === 'private' && vault.used) {
                             if (ws.readyState === WebSocket.OPEN) {
                                 ws.send(JSON.stringify({ 
@@ -423,23 +478,20 @@ wss.on('connection', (ws) => {
                         if (ws.readyState === WebSocket.OPEN) {
                             ws.send(JSON.stringify({
                                 type: 'vault_joined',
-                                joinedVaultId: foundPublicVaultId,
+                                joinedVaultId: foundVaultId,
                                 joinedVaultName: data.vaultName,
                                 joinedVaultType: vault.type,
                                 joinedExpiration: vault.expiration,
-                                encryptedKeyB64: vault.encryptedKeyB64,
-                                ivB64: vault.ivB64,
-                                saltB64: vault.saltB64,
                                 vaultHash: data.vaultHash
                             }));
                         }
                         
-                        console.log(`User ${currentUserId} joined vault ${foundPublicVaultId}.`);
+                        console.log(`User ${currentUserId} joined vault ${foundVaultId}.`);
                         
                         // Send any pending offline messages for this vault to the new member
                         if (offlineMessages[currentUserId]) {
                             const relevantMessages = offlineMessages[currentUserId].filter(
-                                msg => msg.vaultId === foundPublicVaultId
+                                msg => msg.vaultId === foundVaultId
                             );
                             if (relevantMessages.length > 0 && ws.readyState === WebSocket.OPEN) {
                                 ws.send(JSON.stringify({ 
@@ -447,7 +499,7 @@ wss.on('connection', (ws) => {
                                     messages: relevantMessages 
                                 }));
                                 offlineMessages[currentUserId] = offlineMessages[currentUserId].filter(
-                                    msg => msg.vaultId !== foundPublicVaultId
+                                    msg => msg.vaultId !== foundVaultId
                                 );
                                 if (offlineMessages[currentUserId].length === 0) {
                                     delete offlineMessages[currentUserId];
