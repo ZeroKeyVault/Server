@@ -1,7 +1,7 @@
 {
   "name": "the-platform-server",
   "version": "1.0.0",
-  "description": "Node.js relay server for The Platform private messaging app with post-quantum security.",
+  "description": "Node.js relay server for The Platform private messaging app.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -11,15 +11,12 @@
     "chat",
     "relay",
     "privacy",
-    "p2p",
-    "post-quantum",
-    "kyber"
+    "p2p"
   ],
   "author": "Prakhar Solanki",
   "license": "ISC",
   "dependencies": {
     "express": "^4.19.2",
-    "ws": "^8.18.0",
-    "crystals-kyber": "^1.1.1"
+    "ws": "^8.18.0"
   }
 }
