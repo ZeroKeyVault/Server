@@ -5,8 +5,6 @@ const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-// --- Import Kyber ---
-const { Kyber768 } = require('@noble/post-quantum/kyber');
 
 const app = express();
 const server = http.createServer(app);
@@ -57,7 +55,6 @@ for (const vaultId in vaults) {
 offlineMessages = loadData(OFFLINE_MESSAGES_FILE, {});
 
 // --- Cryptography on Server (for vault key encryption/decryption) ---
-// Standard PBKDF2 logic remains for Public Vaults
 async function deriveKeyFromHashServer(password, salt) {
     return new Promise((resolve, reject) => {
         crypto.pbkdf2(password, salt, 100000, 32, 'sha256', (err, derivedKey) => {
@@ -118,177 +115,101 @@ wss.on('connection', (ws) => {
                 const vaultId = crypto.randomUUID();
                 const vaultHash = crypto.randomBytes(16).toString('hex');
                 const rawVaultKey = Buffer.from(data.rawVaultKeyB64, 'base64');
-                const vaultType = data.vaultType; // Get vault type
+                const salt = Buffer.from(data.saltB64, 'base64');
 
-                let vaultDataToStore = {
+                const derivedKeyForVaultKey = await deriveKeyFromHashServer(vaultHash, salt);
+                const ivForVaultKey = crypto.randomBytes(16);
+                const encryptedVaultKey = encryptDataServer(rawVaultKey, derivedKeyForVaultKey, ivForVaultKey);
+
+                vaults[vaultId] = {
                     name: data.vaultName,
-                    type: vaultType,
+                    type: data.vaultType,
                     expiration: data.expiration,
                     adminId: currentUserId,
+                    encryptedKeyB64: encryptedVaultKey.toString('base64'),
+                    ivB64: ivForVaultKey.toString('base64'),
+                    saltB64: salt.toString('base64'),
+                    used: data.vaultType === 'private' ? false : true,
                     members: new Set([currentUserId]),
                     createdAt: Date.now()
                 };
 
-                if (vaultType === 'public') {
-                    // --- Public Vault Logic (Unchanged) ---
-                    const salt = Buffer.from(data.saltB64, 'base64');
-                    const derivedKeyForVaultKey = await deriveKeyFromHashServer(vaultHash, salt);
-                    const ivForVaultKey = crypto.randomBytes(16);
-                    const encryptedVaultKey = encryptDataServer(rawVaultKey, derivedKeyForVaultKey, ivForVaultKey);
-                    vaultDataToStore.encryptedKeyB64 = encryptedVaultKey.toString('base64');
-                    vaultDataToStore.ivB64 = ivForVaultKey.toString('base64');
-                    vaultDataToStore.saltB64 = salt.toString('base64');
-                    vaultDataToStore.used = true; // Public hashes are not single-use like private ones implicitly were
-
-                    // Response for public vault (Unchanged)
-                    ws.send(JSON.stringify({
-                        type: 'vault_created',
-                        vaultId: vaultId,
-                        vaultHash: vaultHash,
-                        vaultName: data.vaultName,
-                        vaultType: data.vaultType,
-                        expiration: data.expiration,
-                        encryptedKeyB64: encryptedVaultKey.toString('base64'),
-                        ivB64: ivForVaultKey.toString('base64'),
-                        saltB64: salt.toString('base64')
-                    }));
-
-                } else if (vaultType === 'private') {
-                    // --- Private Vault Logic (Kyber PQC) ---
-                    // 1. Validate seed length (rawVaultKey must be 32 bytes for Kyber768 seed)
-                    if (rawVaultKey.length !== 32) {
-                         ws.send(JSON.stringify({ type: 'error', message: 'Invalid key size for private vault creation.' }));
-                         console.error(`User ${currentUserId} attempted to create private vault with invalid key size: ${rawVaultKey.length} bytes.`);
-                         break;
-                    }
-
-                    // 2. Generate Kyber768 keypair using the rawVaultKey as the seed
-                    const seed = new Uint8Array(rawVaultKey); // Use the raw AES key as the seed
-                    const { publicKey: pk_enc, secretKey: sk_enc } = Kyber768.keygen(seed);
-
-                    // 3. Server performs encapsulation using the same seed
-                    //    The ciphertext is deterministic if the seed and pk are the same.
-                    const { ciphertext, sharedSecret } = Kyber768.encapsulate(pk_enc, seed);
-
-                    // 4. Store only the public key and ciphertext on the server
-                    vaultDataToStore.pk_enc_b64 = Buffer.from(pk_enc).toString('base64');
-                    vaultDataToStore.ciphertext_b64 = Buffer.from(ciphertext).toString('base64');
-                    vaultDataToStore.used = false; // Private hash used once
-
-                    // 5. Send back the vault details, pk_enc, and ciphertext to the creator
-                    ws.send(JSON.stringify({
-                        type: 'vault_created',
-                        vaultId: vaultId,
-                        vaultHash: vaultHash,
-                        vaultName: data.vaultName,
-                        vaultType: data.vaultType,
-                        expiration: data.expiration,
-                        pk_enc_b64: Buffer.from(pk_enc).toString('base64'), // Send pk_enc
-                        ciphertext_b64: Buffer.from(ciphertext).toString('base64'), // Send ciphertext
-                        // No encryptedKeyB64, ivB64, saltB64 for private vaults anymore
-                    }));
-                } else {
-                     ws.send(JSON.stringify({ type: 'error', message: 'Invalid vault type.' }));
-                     break;
-                }
-
-                // Store the vault data in memory and save to file
-                vaults[vaultId] = vaultDataToStore;
-                // Convert Set to Array for JSON serialization
-                const serializableVaultsTemp = {};
+                // Serialize and save vaults
+                const vaultsToSave_create = {};
                 for (const [id, v] of Object.entries(vaults)) {
-                    serializableVaultsTemp[id] = { ...v, members: Array.from(v.members) };
+                    vaultsToSave_create[id] = { ...v, members: Array.from(v.members) };
                 }
-                saveData(VAULTS_FILE, serializableVaultsTemp);
+                saveData(VAULTS_FILE, vaultsToSave_create);
 
-                console.log(`Vault ${vaultId} (${vaultType}) created by ${currentUserId}. Hash: ${vaultHash}`);
+                ws.send(JSON.stringify({
+                    type: 'vault_created',
+                    vaultId: vaultId,
+                    vaultHash: vaultHash,
+                    vaultName: data.vaultName,
+                    vaultType: data.vaultType,
+                    expiration: data.expiration,
+                    encryptedKeyB64: encryptedVaultKey.toString('base64'),
+                    ivB64: ivForVaultKey.toString('base64'),
+                    saltB64: salt.toString('base64')
+                }));
+
+                console.log(`Vault ${vaultId} created by ${currentUserId}. Hash: ${vaultHash}`);
                 break;
 
             case 'join_vault':
                 const { vaultHash: joinHash, vaultName: userVaultName } = data;
                 let foundVaultId = null;
-                let foundVault = null;
 
-                // Find the vault by hash
                 for (const id in vaults) {
                     const vault = vaults[id];
-                    if (vault.type === 'public') {
-                        // --- Public Vault Join Logic (Unchanged) ---
-                        const tempSalt = Buffer.from(vault.saltB64, 'base64');
-                        const tempDerivedKey = await deriveKeyFromHashServer(joinHash, tempSalt);
-                        try {
-                            const tempDecryptedKey = decryptDataServer(
-                                Buffer.from(vault.encryptedKeyB64, 'base64'),
-                                tempDerivedKey,
-                                Buffer.from(vault.ivB64, 'base64')
-                            );
-                            foundVaultId = id;
-                            foundVault = vault;
-                            break;
-                        } catch (e) {
-                            continue;
-                        }
-                    } else if (vault.type === 'private' && !vault.used) {
-                         // --- Private Vault Join Logic (Kyber PQC) ---
-                         // For private vaults, we just need to match the hash (assuming hash uniqueness)
-                         // A more robust system might use a separate lookup table.
-                         // For simplicity here, we iterate. In production, index by hash.
-                         if (joinHash === vaultHash) { // This check relies on hash uniqueness
-                             foundVaultId = id;
-                             foundVault = vault;
-                             break;
-                         }
+                    const tempSalt = Buffer.from(vault.saltB64, 'base64');
+                    const tempDerivedKey = await deriveKeyFromHashServer(joinHash, tempSalt);
+                    try {
+                        const tempDecryptedKey = decryptDataServer(
+                            Buffer.from(vault.encryptedKeyB64, 'base64'),
+                            tempDerivedKey,
+                            Buffer.from(vault.ivB64, 'base64')
+                        );
+                        foundVaultId = id;
+                        break;
+                    } catch (e) {
+                        continue;
                     }
                 }
 
-                if (foundVaultId && foundVault) {
-                    if (foundVault.type === 'private' && foundVault.used) {
+                if (foundVaultId) {
+                    const vault = vaults[foundVaultId];
+                    if (vault.type === 'private' && vault.used) {
                         ws.send(JSON.stringify({ type: 'error', message: 'This private vault hash has already been used.' }));
                         return;
                     }
 
-                    foundVault.members.add(currentUserId);
-                    if (foundVault.type === 'private') {
-                        foundVault.used = true;
+                    vault.members.add(currentUserId);
+                    if (vault.type === 'private') {
+                        vault.used = true;
                     }
 
-                    // Save updated vault data
-                    const serializableVaultsTemp = {};
+                    // Serialize and save vaults
+                    const vaultsToSave_join = {};
                     for (const [id, v] of Object.entries(vaults)) {
-                        serializableVaultsTemp[id] = { ...v, members: Array.from(v.members) };
+                        vaultsToSave_join[id] = { ...v, members: Array.from(v.members) };
                     }
-                    saveData(VAULTS_FILE, serializableVaultsTemp);
+                    saveData(VAULTS_FILE, vaultsToSave_join);
 
-                    if (foundVault.type === 'public') {
-                        // --- Response for Public Vault Join (Unchanged) ---
-                        ws.send(JSON.stringify({
-                            type: 'vault_joined',
-                            joinedVaultId: foundVaultId,
-                            joinedVaultName: userVaultName,
-                            joinedVaultType: foundVault.type,
-                            joinedExpiration: foundVault.expiration,
-                            encryptedKeyB64: foundVault.encryptedKeyB64,
-                            ivB64: foundVault.ivB64,
-                            saltB64: foundVault.saltB64,
-                            vaultHash: joinHash
-                        }));
-                    } else if (foundVault.type === 'private') {
-                        // --- Response for Private Vault Join (Kyber PQC) ---
-                        ws.send(JSON.stringify({
-                            type: 'vault_joined',
-                            joinedVaultId: foundVaultId,
-                            joinedVaultName: userVaultName,
-                            joinedVaultType: foundVault.type,
-                            joinedExpiration: foundVault.expiration,
-                            pk_enc_b64: foundVault.pk_enc_b64, // Send pk_enc
-                            ciphertext_b64: foundVault.ciphertext_b64, // Send ciphertext
-                            vaultHash: joinHash
-                        }));
-                    }
+                    ws.send(JSON.stringify({
+                        type: 'vault_joined',
+                        joinedVaultId: foundVaultId,
+                        joinedVaultName: userVaultName,
+                        joinedVaultType: vault.type,
+                        joinedExpiration: vault.expiration,
+                        encryptedKeyB64: vault.encryptedKeyB64,
+                        ivB64: vault.ivB64,
+                        saltB64: vault.saltB64,
+                        vaultHash: joinHash
+                    }));
 
-                    console.log(`User ${currentUserId} joined vault ${foundVaultId} (${foundVault.type}).`);
+                    console.log(`User ${currentUserId} joined vault ${foundVaultId}.`);
 
-                    // Send offline messages
                     if (offlineMessages[currentUserId]) {
                         const relevantMessages = offlineMessages[currentUserId].filter(msg => msg.vaultId === foundVaultId);
                         if (relevantMessages.length > 0) {
@@ -351,11 +272,13 @@ wss.on('connection', (ws) => {
                         }
                     }
                 }
-                const serializableVaultsTemp = {};
+
+                // Serialize and save vaults after nuke
+                const vaultsToSave_nuke = {};
                 for (const [id, v] of Object.entries(vaults)) {
-                     serializableVaultsTemp[id] = { ...v, members: Array.from(v.members) };
+                     vaultsToSave_nuke[id] = { ...v, members: Array.from(v.members) };
                 }
-                saveData(VAULTS_FILE, serializableVaultsTemp);
+                saveData(VAULTS_FILE, vaultsToSave_nuke);
 
                 if (offlineMessages[nukeUserId]) {
                     delete offlineMessages[nukeUserId];
@@ -394,8 +317,8 @@ function checkVaultExpirations() {
         const vault = vaults[vaultId];
         if (vault.expiration === 'never') continue;
         let expirationTimeMs;
-        const match = vault.expiration.match(/(\d+)([hmyd])/); // Added 'd' for day support if needed
-        if (!match) continue; // Skip if format is unexpected
+        const match = vault.expiration.match(/(\d+)([hmyd])/);
+        if (!match) continue;
         const [_, value, unit] = match;
         const numValue = parseInt(value);
         switch (unit) {
@@ -428,11 +351,12 @@ function checkVaultExpirations() {
         }
     }
     if (changed) {
-        const serializableVaultsTemp = {};
+        // Serialize and save vaults and offline messages after expiration check
+        const vaultsToSave_expire = {};
         for (const [id, v] of Object.entries(vaults)) {
-            serializableVaultsTemp[id] = { ...v, members: Array.from(v.members) };
+            vaultsToSave_expire[id] = { ...v, members: Array.from(v.members) };
         }
-        saveData(VAULTS_FILE, serializableVaultsTemp);
+        saveData(VAULTS_FILE, vaultsToSave_expire);
         saveData(OFFLINE_MESSAGES_FILE, offlineMessages);
     }
 }
