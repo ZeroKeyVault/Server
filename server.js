@@ -23,13 +23,13 @@ if (!process.env.DATA_ENCRYPTION_KEY) {
 }
 
 /**
- * Encrypts data for storage using AES-256-GCM
+ * Encrypts data for storage using AES-256-GCM (FIXED VERSION)
  * @param {Buffer|string} data - Data to encrypt
  * @returns {string} Base64 encoded encrypted data with IV prepended
  */
 function encryptForStorage(data) {
     const iv = crypto.randomBytes(ENCRYPTION_IV_SIZE);
-    const cipher = crypto.createCipher('aes-256-gcm', ENCRYPTION_KEY);
+    const cipher = crypto.createCipherGCM('aes-256-gcm', ENCRYPTION_KEY);
     cipher.setAAD(Buffer.from('platform-storage', 'utf8')); // Additional authenticated data
     
     let encrypted = cipher.update(data, 'utf8', 'base64');
@@ -48,7 +48,7 @@ function encryptForStorage(data) {
 }
 
 /**
- * Decrypts data from storage using AES-256-GCM
+ * Decrypts data from storage using AES-256-GCM (FIXED VERSION)
  * @param {string} encryptedData - Base64 encoded encrypted data
  * @returns {string} Decrypted data
  */
@@ -61,7 +61,7 @@ function decryptFromStorage(encryptedData) {
         const authTag = combined.slice(ENCRYPTION_IV_SIZE, ENCRYPTION_IV_SIZE + 16);
         const encrypted = combined.slice(ENCRYPTION_IV_SIZE + 16);
         
-        const decipher = crypto.createDecipher('aes-256-gcm', ENCRYPTION_KEY);
+        const decipher = crypto.createDecipherGCM('aes-256-gcm', ENCRYPTION_KEY);
         decipher.setAAD(Buffer.from('platform-storage', 'utf8'));
         decipher.setAuthTag(authTag);
         
@@ -219,7 +219,7 @@ class ServerKyberKEM {
 
 const serverKyber = new ServerKyberKEM();
 
-// --- Enhanced Cryptography Functions ---
+// --- Enhanced Cryptography Functions (FIXED) ---
 
 /**
  * Derives a cryptographic key from a given password (hash) using PBKDF2.
@@ -237,21 +237,23 @@ async function deriveKeyFromHashServer(password, salt) {
 }
 
 /**
- * Encrypts data using AES-256-GCM.
+ * Encrypts data using AES-256-GCM (FIXED VERSION).
  * @param {Buffer} data - The data to encrypt.
  * @param {Buffer} key - The AES key (32 bytes).
  * @param {Buffer} iv - The IV (16 bytes).
  * @returns {Buffer} Encrypted data with auth tag appended.
  */
 function encryptDataServer(data, key, iv) {
-    const cipher = crypto.createCipher('aes-256-gcm', key, iv);
+    const cipher = crypto.createCipherGCM('aes-256-gcm', key);
+    cipher.setAAD(Buffer.from('vault-data', 'utf8'));
+    
     const encrypted = Buffer.concat([cipher.update(data), cipher.final()]);
     const tag = cipher.getAuthTag();
     return Buffer.concat([encrypted, tag]); // Append auth tag
 }
 
 /**
- * Decrypts data using AES-256-GCM.
+ * Decrypts data using AES-256-GCM (FIXED VERSION).
  * @param {Buffer} encryptedDataWithTag - The encrypted data with auth tag.
  * @param {Buffer} key - The AES key (32 bytes).
  * @param {Buffer} iv - The IV (16 bytes).
@@ -262,8 +264,10 @@ function decryptDataServer(encryptedDataWithTag, key, iv) {
     const encryptedData = encryptedDataWithTag.slice(0, encryptedDataWithTag.length - tagLength);
     const tag = encryptedDataWithTag.slice(encryptedDataWithTag.length - tagLength);
 
-    const decipher = crypto.createDecipher('aes-256-gcm', key, iv);
+    const decipher = crypto.createDecipherGCM('aes-256-gcm', key);
+    decipher.setAAD(Buffer.from('vault-data', 'utf8'));
     decipher.setAuthTag(tag);
+    
     const decrypted = Buffer.concat([decipher.update(encryptedData), decipher.final()]);
     return decrypted;
 }
@@ -347,6 +351,7 @@ wss.on('connection', (ws) => {
                 delete offlineMessages[currentUserId]; // Clear after sending
                 saveEncryptedData(OFFLINE_MESSAGES_FILE, offlineMessages);
             }
+            return; // Handle register separately
         } else if (!currentUserId) {
             // Reject messages if user is not registered yet
             ws.send(JSON.stringify({ type: 'error', message: 'Please register your user ID first.' }));
@@ -658,312 +663,4 @@ wss.on('connection', (ws) => {
 
                     // Disconnect the client
                     if (connectedClients[nukeUserId]) {
-                        connectedClients[nukeUserId].close();
-                        delete connectedClients[nukeUserId];
-                    }
-                    
-                    console.log(`User ${nukeUserId.substring(0, 8)}... data completely nuked from server.`);
-                    break;
-
-                default:
-                    ws.send(JSON.stringify({ type: 'error', message: 'Unknown message type.' }));
-                    console.log(`Unknown message type: ${data.type} from ${currentUserId.substring(0, 8)}...`);
-                    break;
-            }
-        } catch (error) {
-            console.error(`Error processing message from ${currentUserId ? currentUserId.substring(0, 8) + '...' : 'unknown'}:`, error);
-            ws.send(JSON.stringify({ type: 'error', message: 'Internal server error occurred.' }));
-        }
-    });
-
-    ws.on('close', () => {
-        if (currentUserId) {
-            delete connectedClients[currentUserId];
-            console.log(`User ${currentUserId.substring(0, 8)}... disconnected.`);
-        }
-    });
-
-    ws.on('error', (error) => {
-        console.error(`WebSocket error for user ${currentUserId ? currentUserId.substring(0, 8) + '...' : 'unknown'}:`, error);
-    });
-});
-
-// --- Vault Expiration Logic ---
-function checkVaultExpirations() {
-    const now = Date.now();
-    const expiredVaultIds = [];
-    
-    for (const vaultId in vaults) {
-        const vault = vaults[vaultId];
-        if (vault.expiration === 'never') continue;
-
-        let expirationTimeMs;
-        if (vault.expiration.endsWith('h')) {
-            expirationTimeMs = parseInt(vault.expiration) * 60 * 60 * 1000;
-        } else if (vault.expiration.endsWith('mo')) {
-            expirationTimeMs = parseInt(vault.expiration) * 30 * 24 * 60 * 60 * 1000;
-        } else if (vault.expiration.endsWith('yr')) {
-            expirationTimeMs = parseInt(vault.expiration) * 365 * 24 * 60 * 60 * 1000;
-        } else {
-            continue; // Unknown format, skip
-        }
-
-        if (vault.createdAt + expirationTimeMs < now) {
-            console.log(`Vault ${vault.name} (${vaultId}) has expired. Notifying members and deleting.`);
-            
-            // Notify members before deleting
-            vault.members.forEach(memberId => {
-                const memberWs = connectedClients[memberId];
-                if (memberWs && memberWs.readyState === WebSocket.OPEN) {
-                    memberWs.send(JSON.stringify({
-                        type: 'vault_expired_notification',
-                        expiredVaultId: vaultId,
-                        expiredVaultName: vault.name
-                    }));
-                }
-                
-                // Remove offline messages for this vault
-                if (offlineMessages[memberId]) {
-                    const originalLength = offlineMessages[memberId].length;
-                    offlineMessages[memberId] = offlineMessages[memberId].filter(msg => msg.vaultId !== vaultId);
-                    if (offlineMessages[memberId].length === 0) {
-                        delete offlineMessages[memberId];
-                    }
-                    if (originalLength > offlineMessages[memberId].length) {
-                        console.log(`Removed ${originalLength - offlineMessages[memberId].length} expired offline messages for user ${memberId.substring(0, 8)}...`);
-                    }
-                }
-            });
-            
-            expiredVaultIds.push(vaultId);
-        }
-    }
-    
-    // Remove expired vaults
-    if (expiredVaultIds.length > 0) {
-        expiredVaultIds.forEach(vaultId => delete vaults[vaultId]);
-        saveEncryptedData(VAULTS_FILE, vaults);
-        saveEncryptedData(OFFLINE_MESSAGES_FILE, offlineMessages);
-        console.log(`Cleaned up ${expiredVaultIds.length} expired vaults.`);
-    }
-}
-
-// Check expirations every minute
-setInterval(checkVaultExpirations, 60 * 1000);
-
-// --- Data Cleanup and Maintenance ---
-function performMaintenance() {
-    console.log('Performing server maintenance...');
-    
-    // Clean up old user keys (older than 30 days)
-    const thirtyDaysAgo = Date.now() - (30 * 24 * 60 * 60 * 1000);
-    let cleanedKeys = 0;
-    
-    for (const userId in userKeys) {
-        if (userKeys[userId].keyTimestamp < thirtyDaysAgo) {
-            // Check if user has any active vaults
-            let hasActiveVaults = false;
-            for (const vaultId in vaults) {
-                if (vaults[vaultId].members.has(userId)) {
-                    hasActiveVaults = true;
-                    break;
-                }
-            }
-            
-            if (!hasActiveVaults) {
-                delete userKeys[userId];
-                cleanedKeys++;
-            }
-        }
-    }
-    
-    if (cleanedKeys > 0) {
-        saveEncryptedData(USER_KEYS_FILE, userKeys);
-        console.log(`Cleaned up ${cleanedKeys} old user keys.`);
-    }
-    
-    // Clean up empty offline message queues
-    let cleanedQueues = 0;
-    for (const userId in offlineMessages) {
-        if (offlineMessages[userId].length === 0) {
-            delete offlineMessages[userId];
-            cleanedQueues++;
-        }
-    }
-    
-    if (cleanedQueues > 0) {
-        saveEncryptedData(OFFLINE_MESSAGES_FILE, offlineMessages);
-        console.log(`Cleaned up ${cleanedQueues} empty offline message queues.`);
-    }
-    
-    console.log('Maintenance completed.');
-}
-
-// Run maintenance every 6 hours
-setInterval(performMaintenance, 6 * 60 * 60 * 1000);
-
-// --- HTTP Server for Health Checks ---
-app.get('/', (req, res) => {
-    const kyberVaults = Object.values(vaults).filter(v => v.isKyberEncrypted).length;
-    const regularVaults = Object.values(vaults).filter(v => !v.isKyberEncrypted).length;
-    
-    res.send(`
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>The Platform Relay Server</title>
-            <style>
-                body { font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }
-                .container { background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-                .status { color: #28a745; font-weight: bold; }
-                .metric { margin: 10px 0; padding: 10px; background: #f8f9fa; border-radius: 5px; }
-                .kyber { color: #6f42c1; font-weight: bold; }
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <h1>🔐 The Platform Relay Server</h1>
-                <h2 class="status">✅ Server Status: Active</h2>
-                
-                <h3>🛡️ Security Features:</h3>
-                <ul>
-                    <li><span class="kyber">Real Kyber Encryption</span> for Private Vaults</li>
-                    <li>🔒 AES-256-GCM Data-at-Rest Encryption</li>
-                    <li>🔐 PBKDF2 Key Derivation for Public Vaults</li>
-                    <li>🚫 Zero-Knowledge Architecture</li>
-                    <li>⏰ Automatic Vault Expiration</li>
-                    <li>📨 Offline Message Queuing</li>
-                </ul>
-                
-                <h3>📊 Server Statistics:</h3>
-                <div class="metric">Total Vaults: <strong>${Object.keys(vaults).length}</strong></div>
-                <div class="metric">Kyber Encrypted Vaults: <strong class="kyber">${kyberVaults}</strong></div>
-                <div class="metric">Regular Vaults: <strong>${regularVaults}</strong></div>
-                <div class="metric">Connected Clients: <strong>${Object.keys(connectedClients).length}</strong></div>
-                <div class="metric">User Keys Stored: <strong>${Object.keys(userKeys).length}</strong></div>
-                <div class="metric">Offline Message Queues: <strong>${Object.keys(offlineMessages).length}</strong></div>
-                <div class="metric">Server Uptime: <strong>${Math.floor(process.uptime() / 3600)}h ${Math.floor((process.uptime() % 3600) / 60)}m</strong></div>
-                
-                <p><em>Enhanced by Prakhar Solanki with Real Kyber Post-Quantum Cryptography</em></p>
-            </div>
-        </body>
-        </html>
-    `);
-});
-
-// Health check endpoint for monitoring
-app.get('/health', (req, res) => {
-    const kyberVaults = Object.values(vaults).filter(v => v.isKyberEncrypted).length;
-    const regularVaults = Object.values(vaults).filter(v => !v.isKyberEncrypted).length;
-    
-    res.json({
-        status: 'healthy',
-        timestamp: new Date().toISOString(),
-        vaults: {
-            total: Object.keys(vaults).length,
-            kyber: kyberVaults,
-            regular: regularVaults
-        },
-        connectedClients: Object.keys(connectedClients).length,
-        userKeys: Object.keys(userKeys).length,
-        offlineMessageQueues: Object.keys(offlineMessages).length,
-        uptime: process.uptime(),
-        security: {
-            dataAtRestEncryption: true,
-            kyberEncryption: true,
-            zeroKnowledge: true
-        }
-    });
-});
-
-// Statistics endpoint (protected in production)
-app.get('/stats', (req, res) => {
-    const kyberVaults = Object.values(vaults).filter(v => v.isKyberEncrypted).length;
-    const regularVaults = Object.values(vaults).filter(v => !v.isKyberEncrypted).length;
-    
-    res.json({
-        timestamp: new Date().toISOString(),
-        vaults: {
-            total: Object.keys(vaults).length,
-            kyber: kyberVaults,
-            regular: regularVaults,
-            private: Object.values(vaults).filter(v => v.type === 'private').length,
-            public: Object.values(vaults).filter(v => v.type === 'public').length
-        },
-        users: {
-            connectedClients: Object.keys(connectedClients).length,
-            storedKeys: Object.keys(userKeys).length
-        },
-        messages: {
-            offlineQueues: Object.keys(offlineMessages).length,
-            totalOfflineMessages: Object.values(offlineMessages).reduce((sum, queue) => sum + queue.length, 0)
-        },
-        system: {
-            uptime: process.uptime(),
-            memoryUsage: process.memoryUsage(),
-            nodeVersion: process.version
-        },
-        security: {
-            dataAtRestEncryption: '✅ AES-256-GCM',
-            kyberSupport: '✅ Post-Quantum Ready',
-            zeroKnowledge: '✅ Server Never Sees Plaintext',
-            autoExpiration: '✅ Active'
-        }
-    });
-});
-
-// Error handling
-process.on('uncaughtException', (error) => {
-    console.error('Uncaught Exception:', error);
-    // In production, you might want to restart the process
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-    console.error('Unhandled Rejection at:', promise, 'reason:', reason);
-});
-
-// Graceful shutdown
-process.on('SIGTERM', () => {
-    console.log('SIGTERM received, performing graceful shutdown...');
-    
-    // Save all data before shutting down
-    saveEncryptedData(VAULTS_FILE, vaults);
-    saveEncryptedData(OFFLINE_MESSAGES_FILE, offlineMessages);
-    saveEncryptedData(USER_KEYS_FILE, userKeys);
-    
-    // Close all WebSocket connections
-    wss.clients.forEach((client) => {
-        if (client.readyState === WebSocket.OPEN) {
-            client.close();
-        }
-    });
-    
-    server.close(() => {
-        console.log('Server shutdown complete.');
-        process.exit(0);
-    });
-});
-
-// Start the server
-server.listen(PORT, () => {
-    console.log('🚀 ===================================================');
-    console.log(`🔐 The Platform Relay Server with Real Kyber Encryption`);
-    console.log(`📡 Server listening on port ${PORT}`);
-    console.log('🛡️  Enhanced Security Features:');
-    console.log('   ✅ Real Kyber Post-Quantum Encryption for Private Vaults');
-    console.log('   ✅ AES-256-GCM Data-at-Rest Encryption');
-    console.log('   ✅ PBKDF2 Key Derivation for Public Vaults');
-    console.log('   ✅ Zero-Knowledge Architecture');
-    console.log('   ✅ Automatic Vault Expiration');
-    console.log('   ✅ Offline Message Queuing');
-    console.log('   ✅ Encrypted Storage with Restricted Permissions');
-    console.log('🔑 Data Encryption Status:', ENCRYPTION_KEY ? '✅ Active' : '❌ Disabled');
-    console.log(`📊 Loaded ${Object.keys(vaults).length} vaults, ${Object.keys(userKeys).length} user keys`);
-    console.log('===================================================');
-    
-    // Run initial maintenance check
-    setTimeout(() => {
-        checkVaultExpirations();
-        performMaintenance();
-    }, 5000);
-});
+                        connectedClients[nukeUs
