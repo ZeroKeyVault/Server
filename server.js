@@ -1,4 +1,4 @@
-// server.js - Enhanced with Real Kyber and Data-at-Rest Encryption
+// server.js - Enhanced with Real Kyber and Data-at-Rest Encryption (FIXED)
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
@@ -244,7 +244,7 @@ async function deriveKeyFromHashServer(password, salt) {
  * @returns {Buffer} Encrypted data with auth tag appended.
  */
 function encryptDataServer(data, key, iv) {
-    const cipher = crypto.createCipher('aes-256-gcm', key);
+    const cipher = crypto.createCipher('aes-256-gcm', key, iv);
     const encrypted = Buffer.concat([cipher.update(data), cipher.final()]);
     const tag = cipher.getAuthTag();
     return Buffer.concat([encrypted, tag]); // Append auth tag
@@ -262,7 +262,7 @@ function decryptDataServer(encryptedDataWithTag, key, iv) {
     const encryptedData = encryptedDataWithTag.slice(0, encryptedDataWithTag.length - tagLength);
     const tag = encryptedDataWithTag.slice(encryptedDataWithTag.length - tagLength);
 
-    const decipher = crypto.createDecipher('aes-256-gcm', key);
+    const decipher = crypto.createDecipher('aes-256-gcm', key, iv);
     decipher.setAuthTag(tag);
     const decrypted = Buffer.concat([decipher.update(encryptedData), decipher.final()]);
     return decrypted;
