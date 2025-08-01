@@ -1,77 +1,48 @@
-// server.js - Enhanced with Real Kyber and Data-at-Rest Encryption (FIXED)
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
-
 const PORT = process.env.PORT || 3000;
 
 // --- Data-at-Rest Encryption Configuration ---
 const ENCRYPTION_KEY = process.env.DATA_ENCRYPTION_KEY || crypto.randomBytes(32); // 256-bit key
-const ENCRYPTION_IV_SIZE = 16; // 128-bit IV for AES-GCM
+const ENCRYPTION_IV_SIZE = 12; // 12 bytes (96 bits) for AES-GCM
 
-// Warning: In production, use a proper key management system
 if (!process.env.DATA_ENCRYPTION_KEY) {
     console.warn('WARNING: Using auto-generated encryption key. Data will be lost on restart!');
-    console.warn('Set DATA_ENCRYPTION_KEY environment variable for persistent encryption.');
 }
 
-/**
- * Encrypts data for storage using AES-256-GCM (FIXED VERSION)
- * @param {Buffer|string} data - Data to encrypt
- * @returns {string} Base64 encoded encrypted data with IV prepended
- */
 function encryptForStorage(data) {
     const iv = crypto.randomBytes(ENCRYPTION_IV_SIZE);
-    const cipher = crypto.createCipherGCM('aes-256-gcm', ENCRYPTION_KEY);
-    cipher.setAAD(Buffer.from('platform-storage', 'utf8')); // Additional authenticated data
-    
-    let encrypted = cipher.update(data, 'utf8', 'base64');
-    encrypted += cipher.final('base64');
-    
+    const cipher = crypto.createCipheriv('aes-256-gcm', ENCRYPTION_KEY, iv);
+    cipher.setAAD(Buffer.from('platform-storage', 'utf8'));
+    let encrypted = cipher.update(data, 'utf8');
+    encrypted = Buffer.concat([encrypted, cipher.final()]);
     const authTag = cipher.getAuthTag();
-    
-    // Combine IV + AuthTag + Encrypted Data
-    const combined = Buffer.concat([
-        iv,
-        authTag,
-        Buffer.from(encrypted, 'base64')
-    ]);
-    
+    const combined = Buffer.concat([iv, authTag, encrypted]);
     return combined.toString('base64');
 }
 
-/**
- * Decrypts data from storage using AES-256-GCM (FIXED VERSION)
- * @param {string} encryptedData - Base64 encoded encrypted data
- * @returns {string} Decrypted data
- */
 function decryptFromStorage(encryptedData) {
     try {
         const combined = Buffer.from(encryptedData, 'base64');
-        
-        // Extract components
         const iv = combined.slice(0, ENCRYPTION_IV_SIZE);
         const authTag = combined.slice(ENCRYPTION_IV_SIZE, ENCRYPTION_IV_SIZE + 16);
         const encrypted = combined.slice(ENCRYPTION_IV_SIZE + 16);
-        
-        const decipher = crypto.createDecipherGCM('aes-256-gcm', ENCRYPTION_KEY);
+        const decipher = crypto.createDecipheriv('aes-256-gcm', ENCRYPTION_KEY, iv);
         decipher.setAAD(Buffer.from('platform-storage', 'utf8'));
         decipher.setAuthTag(authTag);
-        
-        let decrypted = decipher.update(encrypted, null, 'utf8');
-        decrypted += decipher.final('utf8');
-        
-        return decrypted;
+        let decrypted = decipher.update(encrypted);
+        decrypted = Buffer.concat([decrypted, decipher.final()]);
+        return decrypted.toString('utf8');
     } catch (error) {
         console.error('Failed to decrypt storage data:', error.message);
-        throw new Error('Data decryption failed - possible corruption or wrong key');
+        throw new Error('Data decryption failed');
     }
 }
 
@@ -81,22 +52,15 @@ const VAULTS_FILE = path.join(DATA_DIR, 'vaults.enc');
 const OFFLINE_MESSAGES_FILE = path.join(DATA_DIR, 'offline_messages.enc');
 const USER_KEYS_FILE = path.join(DATA_DIR, 'user_keys.enc');
 
-// Ensure data directory exists
 if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 }); // Restricted permissions
+    fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
 }
 
-let vaults = {}; // vaultId -> { name, type, expiration, adminId, encryptedKeyB64, ivB64, saltB64, used, members: Set<userId>, isKyberEncrypted, kyberCiphertext, vaultHashReference }
-let offlineMessages = {}; // userId -> [{ vaultId, senderId, encryptedMessage, iv, timestamp, isFile, fileName, fileMimeType }]
-let connectedClients = {}; // userId -> WebSocket
-let userKeys = {}; // userId -> { publicKey, keyTimestamp }
+let vaults = {};
+let offlineMessages = {};
+let connectedClients = {};
+let userKeys = {};
 
-/**
- * Loads encrypted data from a file.
- * @param {string} filePath - Path to the encrypted file.
- * @param {object} defaultData - Default data if file doesn't exist or is empty.
- * @returns {object} Parsed data.
- */
 function loadEncryptedData(filePath, defaultData) {
     try {
         if (fs.existsSync(filePath)) {
@@ -105,38 +69,25 @@ function loadEncryptedData(filePath, defaultData) {
             return JSON.parse(decryptedData);
         }
     } catch (error) {
-        console.error(`Error loading encrypted data from ${filePath}:`, error.message);
+        console.error(`Error loading ${filePath}:`, error.message);
         console.warn(`Using default data for ${path.basename(filePath)}`);
     }
     return defaultData;
 }
 
-/**
- * Saves encrypted data to a file.
- * @param {string} filePath - Path to the encrypted file.
- * @param {object} data - Data to save.
- */
 function saveEncryptedData(filePath, data) {
     try {
-        // Convert Sets to Arrays for JSON serialization
-        const serializableData = JSON.parse(JSON.stringify(data, (key, value) => {
-            if (value instanceof Set) {
-                return Array.from(value);
-            }
-            return value;
-        }));
-        
+        const serializableData = JSON.parse(JSON.stringify(data, (key, value) => 
+            value instanceof Set ? Array.from(value) : value
+        ));
         const jsonData = JSON.stringify(serializableData, null, 2);
         const encryptedData = encryptForStorage(jsonData);
-        
-        // Write to temporary file first, then rename (atomic operation)
         const tempFile = filePath + '.tmp';
-        fs.writeFileSync(tempFile, encryptedData, { mode: 0o600 }); // Restricted permissions
+        fs.writeFileSync(tempFile, encryptedData, { mode: 0o600 });
         fs.renameSync(tempFile, filePath);
-        
         console.log(`Encrypted data saved to ${path.basename(filePath)}`);
     } catch (error) {
-        console.error(`Error saving encrypted data to ${filePath}:`, error.message);
+        console.error(`Error saving to ${filePath}:`, error.message);
     }
 }
 
@@ -146,7 +97,6 @@ vaults = loadEncryptedData(VAULTS_FILE, {});
 offlineMessages = loadEncryptedData(OFFLINE_MESSAGES_FILE, {});
 userKeys = loadEncryptedData(USER_KEYS_FILE, {});
 
-// Convert members arrays back to Sets if loaded from JSON
 for (const vaultId in vaults) {
     if (vaults[vaultId].members && Array.isArray(vaults[vaultId].members)) {
         vaults[vaultId].members = new Set(vaults[vaultId].members);
@@ -158,8 +108,6 @@ for (const vaultId in vaults) {
 console.log(`Loaded ${Object.keys(vaults).length} vaults, ${Object.keys(offlineMessages).length} offline message queues, ${Object.keys(userKeys).length} user keys`);
 
 // --- Real Kyber Implementation (Server-side) ---
-// Since we need to match the client-side implementation, we'll use the same approach
-
 class ServerKyberKEM {
     constructor() {
         this.keySize = 1568; // Kyber-768 public key size
@@ -167,66 +115,40 @@ class ServerKyberKEM {
         this.sharedSecretSize = 32; // 256-bit shared secret
     }
 
-    // Deserialize public key from base64
     deserializePublicKey(base64Data) {
-        const data = Buffer.from(base64Data, 'base64');
-        return {
-            data: data,
-            type: 'kyber-public-key'
-        };
+        return { data: Buffer.from(base64Data, 'base64'), type: 'kyber-public-key' };
     }
 
-    // Serialize ciphertext to base64
     serializeCiphertext(ciphertext) {
         return ciphertext.toString('base64');
     }
 
-    // Deserialize ciphertext from base64
     deserializeCiphertext(base64Data) {
         return Buffer.from(base64Data, 'base64');
     }
 
-    // Encapsulation: Generate shared secret + ciphertext (server-side compatible)
     async encapsulate(publicKey) {
-        // Generate random seed for encapsulation
         const randomSeed = crypto.randomBytes(32);
-        
-        // Derive shared secret from random seed and public key
         const sharedSecretInput = Buffer.concat([randomSeed, publicKey.data]);
         const sharedSecretHash = crypto.createHash('sha256').update(sharedSecretInput).digest();
-
-        // Generate ciphertext from random seed and public key
         const ciphertext = Buffer.alloc(this.ciphertextSize);
         let ciphertextInput = Buffer.concat([randomSeed, publicKey.data.slice(0, 256)]);
-
+        
         for (let i = 0; i < ciphertext.length; i += 32) {
             const hash = crypto.createHash('sha256').update(ciphertextInput).digest();
             const remaining = Math.min(32, ciphertext.length - i);
             hash.copy(ciphertext, i, 0, remaining);
-            
-            // Update input for next iteration
             if (i + 32 < ciphertext.length) {
                 ciphertextInput[ciphertextInput.length - 1] = (ciphertextInput[ciphertextInput.length - 1] + 1) % 256;
             }
         }
-
-        return {
-            ciphertext: ciphertext,
-            sharedSecret: sharedSecretHash
-        };
+        return { ciphertext, sharedSecret: sharedSecretHash };
     }
 }
 
 const serverKyber = new ServerKyberKEM();
 
-// --- Enhanced Cryptography Functions (FIXED) ---
-
-/**
- * Derives a cryptographic key from a given password (hash) using PBKDF2.
- * @param {string} password - The vault hash (password).
- * @param {Buffer} salt - A unique salt for key derivation.
- * @returns {Promise<Buffer>} The derived key.
- */
+// --- Enhanced Cryptography Functions ---
 async function deriveKeyFromHashServer(password, salt) {
     return new Promise((resolve, reject) => {
         crypto.pbkdf2(password, salt, 100000, 32, 'sha256', (err, derivedKey) => {
@@ -236,59 +158,31 @@ async function deriveKeyFromHashServer(password, salt) {
     });
 }
 
-/**
- * Encrypts data using AES-256-GCM (FIXED VERSION).
- * @param {Buffer} data - The data to encrypt.
- * @param {Buffer} key - The AES key (32 bytes).
- * @param {Buffer} iv - The IV (16 bytes).
- * @returns {Buffer} Encrypted data with auth tag appended.
- */
 function encryptDataServer(data, key, iv) {
-    const cipher = crypto.createCipherGCM('aes-256-gcm', key);
+    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
     cipher.setAAD(Buffer.from('vault-data', 'utf8'));
-    
     const encrypted = Buffer.concat([cipher.update(data), cipher.final()]);
     const tag = cipher.getAuthTag();
-    return Buffer.concat([encrypted, tag]); // Append auth tag
+    return Buffer.concat([encrypted, tag]);
 }
 
-/**
- * Decrypts data using AES-256-GCM (FIXED VERSION).
- * @param {Buffer} encryptedDataWithTag - The encrypted data with auth tag.
- * @param {Buffer} key - The AES key (32 bytes).
- * @param {Buffer} iv - The IV (16 bytes).
- * @returns {Buffer} Decrypted data.
- */
 function decryptDataServer(encryptedDataWithTag, key, iv) {
-    const tagLength = 16; // AES-GCM default tag length
+    const tagLength = 16;
     const encryptedData = encryptedDataWithTag.slice(0, encryptedDataWithTag.length - tagLength);
     const tag = encryptedDataWithTag.slice(encryptedDataWithTag.length - tagLength);
-
-    const decipher = crypto.createDecipherGCM('aes-256-gcm', key);
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
     decipher.setAAD(Buffer.from('vault-data', 'utf8'));
     decipher.setAuthTag(tag);
-    
     const decrypted = Buffer.concat([decipher.update(encryptedData), decipher.final()]);
     return decrypted;
 }
 
-/**
- * Creates a hash reference for Kyber vault lookup
- * @param {string} vaultHash - The vault hash
- * @returns {string} Hash reference for lookup
- */
 function createKyberVaultReference(vaultHash) {
     return crypto.createHash('sha256').update(vaultHash + 'kyber-vault-ref').digest('hex').substring(0, 32);
 }
 
-/**
- * Finds Kyber vault by hash reference
- * @param {string} vaultHash - The vault hash to search for
- * @returns {string|null} Vault ID if found, null otherwise
- */
 function findKyberVaultByHash(vaultHash) {
     const hashReference = createKyberVaultReference(vaultHash);
-    
     for (const vaultId in vaults) {
         const vault = vaults[vaultId];
         if (vault.isKyberEncrypted && vault.vaultHashReference === hashReference) {
@@ -298,62 +192,42 @@ function findKyberVaultByHash(vaultHash) {
     return null;
 }
 
-/**
- * Stores a user's Kyber public key
- * @param {string} userId - User ID
- * @param {string} publicKeyB64 - Base64 encoded public key
- */
 function storeUserKyberPublicKey(userId, publicKeyB64) {
-    userKeys[userId] = {
-        publicKey: publicKeyB64,
-        keyTimestamp: Date.now()
-    };
+    userKeys[userId] = { publicKey: publicKeyB64, keyTimestamp: Date.now() };
     saveEncryptedData(USER_KEYS_FILE, userKeys);
     console.log(`Stored Kyber public key for user ${userId.substring(0, 8)}...`);
 }
 
-/**
- * Gets a user's Kyber public key
- * @param {string} userId - User ID
- * @returns {string|null} Base64 encoded public key or null if not found
- */
 function getUserKyberPublicKey(userId) {
     const userKey = userKeys[userId];
     return userKey ? userKey.publicKey : null;
 }
 
 // --- WebSocket Server Logic ---
-
 wss.on('connection', (ws) => {
-    let currentUserId = null; // Will be set after 'register' message
+    let currentUserId = null;
 
     ws.on('message', async (message) => {
         let data;
         try {
             data = JSON.parse(message.toString());
         } catch (e) {
-            console.error('Invalid JSON received:', e.message);
             ws.send(JSON.stringify({ type: 'error', message: 'Invalid message format.' }));
             return;
         }
-
-        console.log('Received from client:', data.type, data.userId ? data.userId.substring(0, 8) + '...' : '');
 
         if (data.type === 'register') {
             currentUserId = data.userId;
             connectedClients[currentUserId] = ws;
             console.log(`User ${currentUserId.substring(0, 8)}... connected.`);
-
-            // Send any pending offline messages to the newly connected user
-            if (offlineMessages[currentUserId] && offlineMessages[currentUserId].length > 0) {
+            
+            if (offlineMessages[currentUserId]?.length > 0) {
                 ws.send(JSON.stringify({ type: 'offline_messages', messages: offlineMessages[currentUserId] }));
-                console.log(`Sent ${offlineMessages[currentUserId].length} offline messages to ${currentUserId.substring(0, 8)}...`);
-                delete offlineMessages[currentUserId]; // Clear after sending
+                delete offlineMessages[currentUserId];
                 saveEncryptedData(OFFLINE_MESSAGES_FILE, offlineMessages);
             }
-            return; // Handle register separately
+            return;
         } else if (!currentUserId) {
-            // Reject messages if user is not registered yet
             ws.send(JSON.stringify({ type: 'error', message: 'Please register your user ID first.' }));
             return;
         }
@@ -361,7 +235,6 @@ wss.on('connection', (ws) => {
         try {
             switch (data.type) {
                 case 'store_kyber_public_key':
-                    // Store user's Kyber public key
                     if (!data.publicKey) {
                         ws.send(JSON.stringify({ type: 'error', message: 'Public key is required.' }));
                         return;
@@ -372,48 +245,31 @@ wss.on('connection', (ws) => {
 
                 case 'create_vault':
                     const vaultId = crypto.randomUUID();
-                    const vaultHash = crypto.randomBytes(32).toString('hex'); // Longer hash for better security
-
-                    let encryptedVaultKey;
-                    let ivForVaultKey;
-                    let saltForKey = null;
-                    let kyberCiphertext = null;
-                    let vaultHashReference = null;
+                    const vaultHash = crypto.randomBytes(32).toString('hex');
+                    let encryptedVaultKey, ivForVaultKey, saltForKey = null, kyberCiphertext = null;
                     const isKyberEncrypted = data.isKyberEncrypted || false;
 
                     if (isKyberEncrypted && data.vaultType === 'private') {
-                        // Use Kyber encryption for private vaults
                         if (!data.encryptedVaultKeyB64 || !data.ivB64 || !data.kyberCiphertext) {
                             ws.send(JSON.stringify({ type: 'error', message: 'Missing Kyber encryption data.' }));
                             return;
                         }
-
                         encryptedVaultKey = Buffer.from(data.encryptedVaultKeyB64, 'base64');
                         ivForVaultKey = Buffer.from(data.ivB64, 'base64');
                         kyberCiphertext = data.kyberCiphertext;
-                        vaultHashReference = createKyberVaultReference(vaultHash);
-
-                        console.log(`Creating Kyber-encrypted private vault ${vaultId} for user ${currentUserId.substring(0, 8)}...`);
                     } else {
-                        // Use regular PBKDF2 encryption for public vaults
                         if (!data.rawVaultKeyB64 || !data.saltB64) {
                             ws.send(JSON.stringify({ type: 'error', message: 'Missing PBKDF2 encryption data.' }));
                             return;
                         }
-
                         const rawVaultKey = Buffer.from(data.rawVaultKeyB64, 'base64');
-                        const salt = Buffer.from(data.saltB64, 'base64');
-                        saltForKey = salt;
-
-                        // Server encrypts the raw vault key using a key derived from the vaultHash
-                        const derivedKeyForVaultKey = await deriveKeyFromHashServer(vaultHash, salt);
-                        ivForVaultKey = crypto.randomBytes(16); // IV for encrypting the vault key
+                        saltForKey = Buffer.from(data.saltB64, 'base64');
+                        ivForVaultKey = crypto.randomBytes(12);
+                        const derivedKeyForVaultKey = await deriveKeyFromHashServer(vaultHash, saltForKey);
                         encryptedVaultKey = encryptDataServer(rawVaultKey, derivedKeyForVaultKey, ivForVaultKey);
-
-                        console.log(`Creating PBKDF2-encrypted ${data.vaultType} vault ${vaultId} for user ${currentUserId.substring(0, 8)}...`);
                     }
 
-                    // Store vault information
+                    const vaultHashReference = isKyberEncrypted ? createKyberVaultReference(vaultHash) : null;
                     vaults[vaultId] = {
                         name: data.vaultName,
                         type: data.vaultType,
@@ -422,7 +278,7 @@ wss.on('connection', (ws) => {
                         encryptedKeyB64: encryptedVaultKey.toString('base64'),
                         ivB64: ivForVaultKey.toString('base64'),
                         saltB64: saltForKey ? saltForKey.toString('base64') : null,
-                        used: data.vaultType === 'private' ? false : true,
+                        used: data.vaultType === 'private',
                         members: new Set([currentUserId]),
                         createdAt: Date.now(),
                         isKyberEncrypted: isKyberEncrypted,
@@ -430,14 +286,11 @@ wss.on('connection', (ws) => {
                         vaultHashReference: vaultHashReference
                     };
 
-                    // Save to encrypted storage
                     saveEncryptedData(VAULTS_FILE, vaults);
-
-                    // Send back the vault details and the encrypted key to the creator
                     const createResponse = {
                         type: 'vault_created',
-                        vaultId: vaultId,
-                        vaultHash: vaultHash,
+                        vaultId,
+                        vaultHash,
                         vaultName: data.vaultName,
                         vaultType: data.vaultType,
                         expiration: data.expiration,
@@ -445,31 +298,15 @@ wss.on('connection', (ws) => {
                         ivB64: ivForVaultKey.toString('base64'),
                         isKyberEncrypted: isKyberEncrypted
                     };
-
-                    if (saltForKey) {
-                        createResponse.saltB64 = saltForKey.toString('base64');
-                    }
-                    if (kyberCiphertext) {
-                        createResponse.kyberCiphertext = kyberCiphertext;
-                    }
-
+                    if (saltForKey) createResponse.saltB64 = saltForKey.toString('base64');
+                    if (kyberCiphertext) createResponse.kyberCiphertext = kyberCiphertext;
                     ws.send(JSON.stringify(createResponse));
-                    console.log(`Vault ${vaultId} created successfully. Hash: ${vaultHash.substring(0, 16)}..., Kyber: ${isKyberEncrypted}`);
                     break;
 
                 case 'join_vault':
                     const { vaultHash: joinHash, vaultName: userVaultName } = data;
-                    let foundVaultId = null;
+                    let foundVaultId = findKyberVaultByHash(joinHash) || null;
 
-                    if (!joinHash || !userVaultName) {
-                        ws.send(JSON.stringify({ type: 'error', message: 'Vault hash and name are required.' }));
-                        return;
-                    }
-
-                    // First, try to find Kyber vaults using hash reference
-                    foundVaultId = findKyberVaultByHash(joinHash);
-                    
-                    // If not found, try regular PBKDF2 vaults
                     if (!foundVaultId) {
                         for (const id in vaults) {
                             const vault = vaults[id];
@@ -477,60 +314,40 @@ wss.on('connection', (ws) => {
                                 try {
                                     const tempSalt = Buffer.from(vault.saltB64, 'base64');
                                     const tempDerivedKey = await deriveKeyFromHashServer(joinHash, tempSalt);
-                                    
-                                    // Attempt to decrypt the vault key with the provided hash
                                     decryptDataServer(
                                         Buffer.from(vault.encryptedKeyB64, 'base64'),
                                         tempDerivedKey,
                                         Buffer.from(vault.ivB64, 'base64')
                                     );
-                                    // If decryption succeeds, it means the hash is correct
                                     foundVaultId = id;
                                     break;
-                                } catch (e) {
-                                    // Decryption failed, not the correct hash
-                                    continue;
-                                }
+                                } catch {}
                             }
                         }
                     }
 
                     if (foundVaultId) {
                         const vault = vaults[foundVaultId];
-                        
-                        // Check if private vault hash is already used
                         if (vault.type === 'private' && vault.used) {
-                            ws.send(JSON.stringify({ type: 'error', message: 'This private vault hash has already been used.' }));
+                            ws.send(JSON.stringify({ type: 'error', message: 'Private vault hash already used.' }));
                             return;
                         }
-
-                        // Add user to vault members
                         vault.members.add(currentUserId);
-                        if (vault.type === 'private') {
-                            vault.used = true; // Mark hash as used for private vaults
-                        }
+                        if (vault.type === 'private') vault.used = true;
 
-                        // For Kyber vaults, we need to generate a new ciphertext for this user
                         let responseKyberCiphertext = vault.kyberCiphertext;
-                        
                         if (vault.isKyberEncrypted) {
                             const userPublicKeyB64 = getUserKyberPublicKey(currentUserId);
-                            if (userPublicKeyB64) {
-                                // Generate new ciphertext for this user
-                                const userPublicKey = serverKyber.deserializePublicKey(userPublicKeyB64);
-                                const { ciphertext } = await serverKyber.encapsulate(userPublicKey);
-                                responseKyberCiphertext = serverKyber.serializeCiphertext(ciphertext);
-                                
-                                console.log(`Generated new Kyber ciphertext for user ${currentUserId.substring(0, 8)}... joining vault ${foundVaultId}`);
-                            } else {
-                                ws.send(JSON.stringify({ type: 'error', message: 'Your Kyber public key not found. Please refresh and try again.' }));
+                            if (!userPublicKeyB64) {
+                                ws.send(JSON.stringify({ type: 'error', message: 'Your Kyber public key not found.' }));
                                 return;
                             }
+                            const userPublicKey = serverKyber.deserializePublicKey(userPublicKeyB64);
+                            const { ciphertext } = await serverKyber.encapsulate(userPublicKey);
+                            responseKyberCiphertext = serverKyber.serializeCiphertext(ciphertext);
                         }
 
                         saveEncryptedData(VAULTS_FILE, vaults);
-
-                        // Send the encrypted vault key and IV to the joiner
                         const joinResponse = {
                             type: 'vault_joined',
                             joinedVaultId: foundVaultId,
@@ -542,142 +359,90 @@ wss.on('connection', (ws) => {
                             vaultHash: joinHash,
                             isKyberEncrypted: vault.isKyberEncrypted
                         };
-
-                        if (vault.saltB64) {
-                            joinResponse.saltB64 = vault.saltB64;
-                        }
-                        if (responseKyberCiphertext) {
-                            joinResponse.kyberCiphertext = responseKyberCiphertext;
-                        }
-
+                        if (vault.saltB64) joinResponse.saltB64 = vault.saltB64;
+                        if (responseKyberCiphertext) joinResponse.kyberCiphertext = responseKyberCiphertext;
                         ws.send(JSON.stringify(joinResponse));
-                        console.log(`User ${currentUserId.substring(0, 8)}... joined vault ${foundVaultId} successfully.`);
 
-                        // Send any pending offline messages for this vault to the new member
-                        if (offlineMessages[currentUserId]) {
-                            const relevantMessages = offlineMessages[currentUserId].filter(msg => msg.vaultId === foundVaultId);
-                            if (relevantMessages.length > 0) {
-                                ws.send(JSON.stringify({ type: 'offline_messages', messages: relevantMessages }));
-                                // Remove only the sent messages from offline store
-                                offlineMessages[currentUserId] = offlineMessages[currentUserId].filter(msg => msg.vaultId !== foundVaultId);
-                                if (offlineMessages[currentUserId].length === 0) {
-                                    delete offlineMessages[currentUserId];
-                                }
-                                saveEncryptedData(OFFLINE_MESSAGES_FILE, offlineMessages);
-                            }
+                        const relevantMessages = offlineMessages[currentUserId]?.filter(msg => msg.vaultId === foundVaultId) || [];
+                        if (relevantMessages.length > 0) {
+                            ws.send(JSON.stringify({ type: 'offline_messages', messages: relevantMessages }));
+                            offlineMessages[currentUserId] = offlineMessages[currentUserId].filter(msg => msg.vaultId !== foundVaultId);
+                            if (offlineMessages[currentUserId].length === 0) delete offlineMessages[currentUserId];
+                            saveEncryptedData(OFFLINE_MESSAGES_FILE, offlineMessages);
                         }
                     } else {
-                        ws.send(JSON.stringify({ type: 'error', message: 'Vault not found or hash is incorrect/expired.' }));
-                        console.log(`Failed vault join attempt by ${currentUserId.substring(0, 8)}... with hash ${joinHash.substring(0, 16)}...`);
+                        ws.send(JSON.stringify({ type: 'error', message: 'Vault not found or hash is incorrect.' }));
                     }
                     break;
 
                 case 'send_message':
                     const { vaultId: msgVaultId, senderId, encryptedMessage, iv, timestamp, isFile, fileName, fileMimeType } = data;
-                    
-                    if (!msgVaultId || !senderId || !encryptedMessage || !iv || !timestamp) {
-                        ws.send(JSON.stringify({ type: 'error', message: 'Missing required message fields.' }));
-                        return;
-                    }
-
                     const vault = vaults[msgVaultId];
-
                     if (vault && vault.members.has(senderId)) {
                         const messageToSend = {
                             type: 'new_message',
                             vaultId: msgVaultId,
-                            senderId: senderId,
-                            encryptedMessage: encryptedMessage, // Server only relays encrypted content
-                            iv: iv,
-                            timestamp: timestamp,
+                            senderId,
+                            encryptedMessage,
+                            iv,
+                            timestamp,
                             isFile: isFile || false,
                             fileName: fileName || null,
                             fileMimeType: fileMimeType || null
                         };
 
-                        let deliveredCount = 0;
-                        let offlineCount = 0;
-
+                        let delivered = 0, offline = 0;
                         vault.members.forEach(memberId => {
-                            if (memberId !== senderId) { // Don't send back to sender
+                            if (memberId !== senderId) {
                                 const recipientWs = connectedClients[memberId];
-                                if (recipientWs && recipientWs.readyState === WebSocket.OPEN) {
+                                if (recipientWs?.readyState === WebSocket.OPEN) {
                                     recipientWs.send(JSON.stringify(messageToSend));
-                                    deliveredCount++;
+                                    delivered++;
                                 } else {
-                                    // Store for offline delivery
-                                    if (!offlineMessages[memberId]) {
-                                        offlineMessages[memberId] = [];
-                                    }
+                                    if (!offlineMessages[memberId]) offlineMessages[memberId] = [];
                                     offlineMessages[memberId].push(messageToSend);
-                                    offlineCount++;
+                                    offline++;
                                 }
                             }
                         });
 
-                        if (offlineCount > 0) {
-                            saveEncryptedData(OFFLINE_MESSAGES_FILE, offlineMessages);
-                        }
-
-                        console.log(`Message delivered to ${deliveredCount} online users, ${offlineCount} stored offline for vault ${msgVaultId}`);
+                        if (offline > 0) saveEncryptedData(OFFLINE_MESSAGES_FILE, offlineMessages);
+                        console.log(`Message delivered to ${delivered} online, ${offline} offline for vault ${msgVaultId}`);
                     } else {
                         ws.send(JSON.stringify({ type: 'error', message: 'Vault not found or you are not a member.' }));
-                        console.log(`Message rejected from ${senderId.substring(0, 8)}... for vault ${msgVaultId} - not a member`);
                     }
                     break;
 
                 case 'nuke':
                     const nukeUserId = data.userId;
-                    console.log(`Nuke request received for user: ${nukeUserId.substring(0, 8)}...`);
-
                     let vaultsModified = false;
 
-                    // Remove user from all vaults
                     for (const id in vaults) {
                         if (vaults[id].members.has(nukeUserId)) {
                             vaults[id].members.delete(nukeUserId);
                             vaultsModified = true;
-                            
-                            // If a private vault becomes empty, mark it for cleanup
-                            if (vaults[id].type === 'private' && vaults[id].members.size === 0) {
-                                console.log(`Private vault ${id} is now empty after nuke, will expire naturally.`);
-                            }
                         }
                     }
 
-                    if (vaultsModified) {
-                        saveEncryptedData(VAULTS_FILE, vaults);
-                    }
-
-                    // Clear offline messages for this user
-                    if (offlineMessages[nukeUserId]) {
-                        delete offlineMessages[nukeUserId];
-                        saveEncryptedData(OFFLINE_MESSAGES_FILE, offlineMessages);
-                    }
-
-                    // Clear user's Kyber keys
-                    if (userKeys[nukeUserId]) {
-                        delete userKeys[nukeUserId];
-                        saveEncryptedData(USER_KEYS_FILE, userKeys);
-                    }
-
-                    // Disconnect the client
+                    if (vaultsModified) saveEncryptedData(VAULTS_FILE, vaults);
+                    if (offlineMessages[nukeUserId]) delete offlineMessages[nukeUserId];
+                    if (userKeys[nukeUserId]) delete userKeys[nukeUserId];
                     if (connectedClients[nukeUserId]) {
                         connectedClients[nukeUserId].close();
                         delete connectedClients[nukeUserId];
                     }
 
-                    ws.send(JSON.stringify({ type: 'nuke_complete', message: 'All your data has been cleared from the server.' }));
-                    console.log(`Nuke completed for user ${nukeUserId.substring(0, 8)}...`);
+                    saveEncryptedData(OFFLINE_MESSAGES_FILE, offlineMessages);
+                    saveEncryptedData(USER_KEYS_FILE, userKeys);
+                    ws.send(JSON.stringify({ type: 'nuke_complete', message: 'All data cleared.' }));
                     break;
 
                 default:
-                    console.warn(`Unknown message type: ${data.type} from ${currentUserId.substring(0, 8)}...`);
                     ws.send(JSON.stringify({ type: 'error', message: 'Unknown message type.' }));
                     break;
             }
         } catch (error) {
-            console.error(`Error processing message from ${currentUserId ? currentUserId.substring(0, 8) + '...' : 'unknown'}:`, error);
+            console.error(`Error processing message from ${currentUserId}:`, error);
             ws.send(JSON.stringify({ type: 'error', message: 'Internal server error occurred.' }));
         }
     });
@@ -691,89 +456,62 @@ wss.on('connection', (ws) => {
 
     ws.on('error', (error) => {
         console.error('WebSocket error:', error);
-        if (currentUserId) {
-            delete connectedClients[currentUserId];
-        }
+        if (currentUserId) delete connectedClients[currentUserId];
     });
 });
 
 // --- Vault Expiration Management ---
-/**
- * Parses expiration time string to milliseconds
- * @param {string} expirationStr - Expiration string like "1h", "24h", "1mo", etc.
- * @returns {number} Milliseconds until expiration, or 0 for "never"
- */
 function parseExpirationTime(expirationStr) {
     if (expirationStr === 'never') return 0;
-    
     const timeValue = parseInt(expirationStr.slice(0, -1));
     const timeUnit = expirationStr.slice(-1);
     const timeUnitLong = expirationStr.slice(-2);
-    
+
     switch (timeUnitLong) {
-        case 'mo': return timeValue * 30 * 24 * 60 * 60 * 1000; // months (30 days)
-        case 'yr': return timeValue * 365 * 24 * 60 * 60 * 1000; // years
+        case 'mo': return timeValue * 30 * 24 * 60 * 60 * 1000;
+        case 'yr': return timeValue * 365 * 24 * 60 * 60 * 1000;
         default:
             switch (timeUnit) {
-                case 'h': return timeValue * 60 * 60 * 1000; // hours
-                case 'd': return timeValue * 24 * 60 * 60 * 1000; // days
-                default: return 24 * 60 * 60 * 1000; // default to 24 hours
+                case 'h': return timeValue * 60 * 60 * 1000;
+                case 'd': return timeValue * 24 * 60 * 60 * 1000;
+                default: return 24 * 60 * 60 * 1000;
             }
     }
 }
 
-/**
- * Checks for expired vaults and removes them
- */
 function cleanupExpiredVaults() {
     const now = Date.now();
     const expiredVaults = [];
-    
+
     for (const vaultId in vaults) {
         const vault = vaults[vaultId];
         if (vault.expiration !== 'never') {
             const expirationTime = parseExpirationTime(vault.expiration);
-            const vaultAge = now - (vault.createdAt || now);
-            
-            if (vaultAge > expirationTime) {
+            if (now - vault.createdAt > expirationTime) {
                 expiredVaults.push({ id: vaultId, name: vault.name, members: Array.from(vault.members) });
             }
         }
     }
-    
-    // Remove expired vaults and notify members
-    expiredVaults.forEach(expiredVault => {
-        delete vaults[expiredVault.id];
-        console.log(`Vault expired and removed: ${expiredVault.name} (${expiredVault.id})`);
-        
-        // Notify all members about the expiration
-        expiredVault.members.forEach(memberId => {
+
+    expiredVaults.forEach(({ id, name, members }) => {
+        delete vaults[id];
+        members.forEach(memberId => {
             const memberWs = connectedClients[memberId];
-            if (memberWs && memberWs.readyState === WebSocket.OPEN) {
-                memberWs.send(JSON.stringify({
-                    type: 'vault_expired_notification',
-                    expiredVaultId: expiredVault.id,
-                    expiredVaultName: expiredVault.name
-                }));
+            if (memberWs?.readyState === WebSocket.OPEN) {
+                memberWs.send(JSON.stringify({ type: 'vault_expired_notification', expiredVaultId: id, expiredVaultName: name }));
             }
         });
     });
-    
-    if (expiredVaults.length > 0) {
-        saveEncryptedData(VAULTS_FILE, vaults);
-    }
+
+    if (expiredVaults.length > 0) saveEncryptedData(VAULTS_FILE, vaults);
 }
 
-// Run vault cleanup every hour
 setInterval(cleanupExpiredVaults, 60 * 60 * 1000);
 
 // --- Server Startup ---
 server.listen(PORT, () => {
-    console.log(`🚀 The Platform server running on port ${PORT}`);
-    console.log(`📡 WebSocket server ready for connections`);
-    console.log(`🔐 Data-at-rest encryption: ${process.env.DATA_ENCRYPTION_KEY ? 'Enabled (env key)' : 'Enabled (auto-generated key)'}`);
-    console.log(`🗂️  Data directory: ${DATA_DIR}`);
-    
-    // Initial cleanup of expired vaults on startup
+    console.log(`🚀 Server running on port ${PORT}`);
+    console.log(`🔑 Data-at-rest encryption: ${process.env.DATA_ENCRYPTION_KEY ? 'Enabled (env key)' : 'Enabled (auto-generated key)'}`);
+    console.log(`📂 Data directory: ${DATA_DIR}`);
     cleanupExpiredVaults();
 });
