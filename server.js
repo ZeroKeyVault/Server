@@ -195,11 +195,11 @@ wss.on('connection', (ws) => {
                 // Store the vault data in memory and save to file
                 vaults[vaultId] = vaultDataToStore;
                 // Convert Set to Array for JSON serialization
-                const serializableVaults = {};
+                const serializableVaultsTemp = {};
                 for (const [id, v] of Object.entries(vaults)) {
-                    serializableVaults[id] = { ...v, members: Array.from(v.members) };
+                    serializableVaultsTemp[id] = { ...v, members: Array.from(v.members) };
                 }
-                saveData(VAULTS_FILE, serializableVaults);
+                saveData(VAULTS_FILE, serializableVaultsTemp);
 
                 console.log(`Vault ${vaultId} (${vaultType}) created by ${currentUserId}. Hash: ${vaultHash}`);
                 break;
@@ -253,11 +253,11 @@ wss.on('connection', (ws) => {
                     }
 
                     // Save updated vault data
-                    const serializableVaults = {};
+                    const serializableVaultsTemp = {};
                     for (const [id, v] of Object.entries(vaults)) {
-                        serializableVaults[id] = { ...v, members: Array.from(v.members) };
+                        serializableVaultsTemp[id] = { ...v, members: Array.from(v.members) };
                     }
-                    saveData(VAULTS_FILE, serializableVaults);
+                    saveData(VAULTS_FILE, serializableVaultsTemp);
 
                     if (foundVault.type === 'public') {
                         // --- Response for Public Vault Join (Unchanged) ---
@@ -351,11 +351,11 @@ wss.on('connection', (ws) => {
                         }
                     }
                 }
-                const serializableVaults = {};
+                const serializableVaultsTemp = {};
                 for (const [id, v] of Object.entries(vaults)) {
-                     serializableVaults[id] = { ...v, members: Array.from(v.members) };
+                     serializableVaultsTemp[id] = { ...v, members: Array.from(v.members) };
                 }
-                saveData(VAULTS_FILE, serializableVaults);
+                saveData(VAULTS_FILE, serializableVaultsTemp);
 
                 if (offlineMessages[nukeUserId]) {
                     delete offlineMessages[nukeUserId];
@@ -428,11 +428,11 @@ function checkVaultExpirations() {
         }
     }
     if (changed) {
-        const serializableVaults = {};
+        const serializableVaultsTemp = {};
         for (const [id, v] of Object.entries(vaults)) {
-            serializableVaults[id] = { ...v, members: Array.from(v.members) };
+            serializableVaultsTemp[id] = { ...v, members: Array.from(v.members) };
         }
-        saveData(VAULTS_FILE, serializableVaults);
+        saveData(VAULTS_FILE, serializableVaultsTemp);
         saveData(OFFLINE_MESSAGES_FILE, offlineMessages);
     }
 }
