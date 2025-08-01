@@ -663,4 +663,117 @@ wss.on('connection', (ws) => {
 
                     // Disconnect the client
                     if (connectedClients[nukeUserId]) {
-                        connectedClients[nukeUs
+                        connectedClients[nukeUserId].close();
+                        delete connectedClients[nukeUserId];
+                    }
+
+                    ws.send(JSON.stringify({ type: 'nuke_complete', message: 'All your data has been cleared from the server.' }));
+                    console.log(`Nuke completed for user ${nukeUserId.substring(0, 8)}...`);
+                    break;
+
+                default:
+                    console.warn(`Unknown message type: ${data.type} from ${currentUserId.substring(0, 8)}...`);
+                    ws.send(JSON.stringify({ type: 'error', message: 'Unknown message type.' }));
+                    break;
+            }
+        } catch (error) {
+            console.error(`Error processing message from ${currentUserId ? currentUserId.substring(0, 8) + '...' : 'unknown'}:`, error);
+            ws.send(JSON.stringify({ type: 'error', message: 'Internal server error occurred.' }));
+        }
+    });
+
+    ws.on('close', () => {
+        if (currentUserId) {
+            console.log(`User ${currentUserId.substring(0, 8)}... disconnected.`);
+            delete connectedClients[currentUserId];
+        }
+    });
+
+    ws.on('error', (error) => {
+        console.error('WebSocket error:', error);
+        if (currentUserId) {
+            delete connectedClients[currentUserId];
+        }
+    });
+});
+
+// --- Vault Expiration Management ---
+/**
+ * Parses expiration time string to milliseconds
+ * @param {string} expirationStr - Expiration string like "1h", "24h", "1mo", etc.
+ * @returns {number} Milliseconds until expiration, or 0 for "never"
+ */
+function parseExpirationTime(expirationStr) {
+    if (expirationStr === 'never') return 0;
+    
+    const timeValue = parseInt(expirationStr.slice(0, -1));
+    const timeUnit = expirationStr.slice(-1);
+    const timeUnitLong = expirationStr.slice(-2);
+    
+    switch (timeUnitLong) {
+        case 'mo': return timeValue * 30 * 24 * 60 * 60 * 1000; // months (30 days)
+        case 'yr': return timeValue * 365 * 24 * 60 * 60 * 1000; // years
+        default:
+            switch (timeUnit) {
+                case 'h': return timeValue * 60 * 60 * 1000; // hours
+                case 'd': return timeValue * 24 * 60 * 60 * 1000; // days
+                default: return 24 * 60 * 60 * 1000; // default to 24 hours
+            }
+    }
+}
+
+/**
+ * Checks for expired vaults and removes them
+ */
+function cleanupExpiredVaults() {
+    const now = Date.now();
+    const expiredVaults = [];
+    
+    for (const vaultId in vaults) {
+        const vault = vaults[vaultId];
+        if (vault.expiration !== 'never') {
+            const expirationTime = parseExpirationTime(vault.expiration);
+            const vaultAge = now - (vault.createdAt || now);
+            
+            if (vaultAge > expirationTime) {
+                expiredVaults.push({ id: vaultId, name: vault.name, members: Array.from(vault.members) });
+            }
+        }
+    }
+    
+    // Remove expired vaults and notify members
+    expiredVaults.forEach(expiredVault => {
+        delete vaults[expiredVault.id];
+        console.log(`Vault expired and removed: ${expiredVault.name} (${expiredVault.id})`);
+        
+        // Notify all members about the expiration
+        expiredVault.members.forEach(memberId => {
+            const memberWs = connectedClients[memberId];
+            if (memberWs && memberWs.readyState === WebSocket.OPEN) {
+                memberWs.send(JSON.stringify({
+                    type: 'vault_expired_notification',
+                    expiredVaultId: expiredVault.id,
+                    expiredVaultName: expiredVault.name
+                }));
+            }
+        });
+    });
+    
+    if (expiredVaults.length > 0) {
+        saveEncryptedData(VAULTS_FILE, vaults);
+    }
+}
+
+// Run vault cleanup every hour
+setInterval(cleanupExpiredVaults, 60 * 60 * 1000);
+
+// --- Server Startup ---
+server.listen(PORT, () => {
+    console.log(`🚀 The Platform server running on port ${PORT}`);
+    console.log(`📡 WebSocket server ready for connections`);
+    console.log(`🔐 Data-at-rest encryption: ${process.env.DATA_ENCRYPTION_KEY ? 'Enabled (env key)' : 'Enabled (auto-generated key)'}`);
+    console.log(`🗂️  Data directory: ${DATA_DIR}`);
+    
+    // Initial cleanup of expired vaults on startup
+    cleanupExpiredVaults();
+});
