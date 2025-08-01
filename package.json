@@ -11,12 +11,15 @@
     "chat",
     "relay",
     "privacy",
-    "p2p"
+    "p2p",
+    "post-quantum",
+    "kyber"
   ],
   "author": "Prakhar Solanki",
   "license": "ISC",
   "dependencies": {
     "express": "^4.19.2",
-    "ws": "^8.18.0"
+    "ws": "^8.18.0",
+    "@noble/post-quantum": "^0.1.0" 
   }
 }
