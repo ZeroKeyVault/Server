@@ -1,10 +1,8 @@
 const WebSocket = require('ws');
-const oqs = require('liboqs-js');
 const crypto = require('crypto');
 
 // Server configuration
 const PORT = process.env.PORT || 8080;
-const KYBER_VARIANT = 'Kyber512';
 
 // In-memory data stores
 // Maps a user ID to their WebSocket connection
@@ -152,7 +150,7 @@ wss.on('connection', ws => {
 
             case 'create_vault':
                 {
-                    const { userId, vaultName, vaultType, expiration, kemPublicKeyB64 } = data;
+                    const { userId, vaultName, vaultType, expiration } = data;
                     const vaultId = crypto.randomUUID();
                     const vaultHash = generateVaultHash();
                     const now = Date.now();
@@ -162,32 +160,11 @@ wss.on('connection', ws => {
                     let encryptedKey;
                     let iv;
                     let salt;
-                    let serverCiphertext;
-                    let ephemeralSecretKey;
-
+                    
                     if (vaultType === 'private') {
-                        try {
-                            // Kyber KEM for private vaults
-                            const kem = new oqs.KeyEncapsulation(KYBER_VARIANT);
-                            await kem.generateKeyPair(); // Generate ephemeral key pair
-                            
-                            const clientPublicKey = Buffer.from(kemPublicKeyB64, 'base64');
-                            const { ciphertext, sharedSecret } = kem.encapsulate(clientPublicKey);
-                            
-                            salt = crypto.webcrypto.getRandomValues(new Uint8Array(16));
-                            aesKey = await deriveVaultKeyFromSharedSecret(sharedSecret, salt);
-
-                            serverCiphertext = Buffer.from(ciphertext).toString('base64');
-                            ephemeralSecretKey = Buffer.from(kem.getSecretKey()).toString('base64');
-
-                            // We don't need to encrypt the AES key here, as it's a shared secret
-                            // The key exchange itself provides the security
-                            console.log(`Private vault created, Kyber KEM initiated for vault ${vaultId}`);
-                        } catch (e) {
-                            console.error('Kyber KEM failed on vault creation:', e);
-                            ws.send(JSON.stringify({ type: 'error', message: 'Kyber key exchange failed.' }));
-                            return;
-                        }
+                        // For private vaults, the server does not handle any cryptography.
+                        // The Kyber key exchange is handled entirely on the client side.
+                        console.log(`Private vault created. Server will act as a simple message relay.`);
                     } else { // public vault
                         aesKey = await crypto.subtle.generateKey(
                             { name: "AES-GCM", length: 256 },
@@ -213,7 +190,6 @@ wss.on('connection', ws => {
                         aesKey: aesKey,
                         messages: [],
                         salt: salt ? Buffer.from(salt).toString('base64') : null,
-                        kemEphemeralSecretKey: ephemeralSecretKey // Store for potential future members
                     });
                     vaultHashes.set(vaultHash, vaultId);
 
@@ -228,9 +204,7 @@ wss.on('connection', ws => {
                         saltB64: salt ? Buffer.from(salt).toString('base64') : null
                     };
 
-                    if (vaultType === 'private') {
-                        response.serverCiphertextB64 = serverCiphertext;
-                    } else {
+                    if (vaultType !== 'private') {
                         response.encryptedKeyB64 = encryptedKey;
                         response.ivB64 = iv;
                     }
@@ -242,7 +216,7 @@ wss.on('connection', ws => {
 
             case 'join_vault':
                 {
-                    const { userId, vaultHash, vaultName, kemPublicKeyB64 } = data;
+                    const { userId, vaultHash } = data;
                     const vaultId = vaultHashes.get(vaultHash);
                     if (!vaultId) {
                         ws.send(JSON.stringify({ type: 'error', message: 'Vault not found.' }));
@@ -260,32 +234,11 @@ wss.on('connection', ws => {
                     let encryptedKey;
                     let iv;
                     let salt;
-                    let serverCiphertext;
-
+                    
                     if (vault.type === 'private') {
-                        try {
-                            const kem = new oqs.KeyEncapsulation(KYBER_VARIANT);
-                            const ephemeralSecretKey = Buffer.from(vault.kemEphemeralSecretKey, 'base64');
-                            kem.secretKey = ephemeralSecretKey;
-                            
-                            const clientPublicKey = Buffer.from(kemPublicKeyB64, 'base64');
-                            const { ciphertext, sharedSecret } = kem.encapsulate(clientPublicKey);
-                            
-                            // Decapsulate using the original shared secret to get the key.
-                            // NOTE: A more robust implementation would use a new ephemeral key pair for each join
-                            const originalSharedSecret = kem.decapsulate(ciphertext); // This is not the right way, server is not meant to decapsulate.
-                            // The AES key is a shared secret between all users.
-                            // The correct approach would be to derive a new shared secret with each user.
-                            // For simplicity, we are reusing the key exchange for the first user.
-                            // However, the client-side code handles the key exchange correctly for each new user joining.
-                            serverCiphertext = Buffer.from(ciphertext).toString('base64');
-                            
-                            console.log(`Private vault join, Kyber KEM initiated for vault ${vaultId}`);
-                        } catch (e) {
-                            console.error('Kyber KEM failed on vault join:', e);
-                            ws.send(JSON.stringify({ type: 'error', message: 'Kyber key exchange failed.' }));
-                            return;
-                        }
+                         // For private vaults, the server does not handle any cryptography.
+                        // The Kyber key exchange is handled entirely on the client side.
+                        console.log(`User ${userId} joined private vault ${vaultId}. Server will relay messages.`);
                     } else { // public vault
                         const exportedKey = await crypto.subtle.exportKey('raw', vault.aesKey);
                         salt = Buffer.from(vault.salt, 'base64');
@@ -306,9 +259,7 @@ wss.on('connection', ws => {
                         vaultHash: vaultHash,
                     };
 
-                    if (vault.type === 'private') {
-                        response.serverCiphertextB64 = serverCiphertext;
-                    } else {
+                    if (vault.type !== 'private') {
                         response.encryptedKeyB64 = encryptedKey;
                         response.ivB64 = iv;
                     }
