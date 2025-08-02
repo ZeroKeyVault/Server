@@ -150,7 +150,7 @@ wss.on('connection', ws => {
 
             case 'create_vault':
                 {
-                    const { userId, vaultName, vaultType, expiration } = data;
+                    const { userId, vaultName, vaultType, expiration, kemPublicKeyB64, saltB64 } = data;
                     const vaultId = crypto.randomUUID();
                     const vaultHash = generateVaultHash();
                     const now = Date.now();
@@ -159,11 +159,9 @@ wss.on('connection', ws => {
                     let aesKey;
                     let encryptedKey;
                     let iv;
-                    let salt;
                     
                     if (vaultType === 'private') {
                         // For private vaults, the server does not handle any cryptography.
-                        // The Kyber key exchange is handled entirely on the client side.
                         console.log(`Private vault created. Server will act as a simple message relay.`);
                     } else { // public vault
                         aesKey = await crypto.subtle.generateKey(
@@ -173,7 +171,7 @@ wss.on('connection', ws => {
                         );
                         
                         const exportedKey = await crypto.subtle.exportKey('raw', aesKey);
-                        salt = crypto.webcrypto.getRandomValues(new Uint8Array(16));
+                        const salt = crypto.webcrypto.getRandomValues(new Uint8Array(16));
                         const derivedKey = await deriveKeyFromHash(vaultHash, salt);
                         const encryptedResult = await encryptData(exportedKey, derivedKey);
                         encryptedKey = Buffer.from(encryptedResult.encryptedData).toString('base64');
@@ -189,7 +187,7 @@ wss.on('connection', ws => {
                         type: vaultType,
                         aesKey: aesKey,
                         messages: [],
-                        salt: salt ? Buffer.from(salt).toString('base64') : null,
+                        salt: saltB64 ? Buffer.from(saltB64, 'base64') : null,
                     });
                     vaultHashes.set(vaultHash, vaultId);
 
@@ -201,12 +199,13 @@ wss.on('connection', ws => {
                         vaultHash: vaultHash,
                         vaultType: vaultType,
                         expiration: expirationTime,
-                        saltB64: salt ? Buffer.from(salt).toString('base64') : null
+                        saltB64: saltB64
                     };
-
-                    if (vaultType !== 'private') {
+                    
+                    if (vaultType === 'public') {
                         response.encryptedKeyB64 = encryptedKey;
                         response.ivB64 = iv;
+                        response.saltB64 = Buffer.from(vaults.get(vaultId).salt).toString('base64');
                     }
                     
                     ws.send(JSON.stringify(response));
@@ -216,7 +215,7 @@ wss.on('connection', ws => {
 
             case 'join_vault':
                 {
-                    const { userId, vaultHash } = data;
+                    const { userId, vaultHash, kemPublicKeyB64 } = data;
                     const vaultId = vaultHashes.get(vaultHash);
                     if (!vaultId) {
                         ws.send(JSON.stringify({ type: 'error', message: 'Vault not found.' }));
@@ -233,21 +232,7 @@ wss.on('connection', ws => {
 
                     let encryptedKey;
                     let iv;
-                    let salt;
                     
-                    if (vault.type === 'private') {
-                         // For private vaults, the server does not handle any cryptography.
-                        // The Kyber key exchange is handled entirely on the client side.
-                        console.log(`User ${userId} joined private vault ${vaultId}. Server will relay messages.`);
-                    } else { // public vault
-                        const exportedKey = await crypto.subtle.exportKey('raw', vault.aesKey);
-                        salt = Buffer.from(vault.salt, 'base64');
-                        const derivedKey = await deriveKeyFromHash(vaultHash, salt);
-                        const encryptedResult = await encryptData(exportedKey, derivedKey);
-                        encryptedKey = Buffer.from(encryptedResult.encryptedData).toString('base64');
-                        iv = Buffer.from(encryptedResult.iv).toString('base64');
-                    }
-
                     // Send the vault info back to the joining user
                     const response = {
                         type: 'vault_joined',
@@ -255,13 +240,20 @@ wss.on('connection', ws => {
                         joinedVaultName: vault.vaultName,
                         joinedVaultType: vault.type,
                         joinedExpiration: vault.expiration,
-                        saltB64: vault.salt,
                         vaultHash: vaultHash,
                     };
-
-                    if (vault.type !== 'private') {
+                    
+                    if (vault.type === 'public') {
+                        const exportedKey = await crypto.subtle.exportKey('raw', vault.aesKey);
+                        const salt = Buffer.from(vault.salt, 'base64');
+                        const derivedKey = await deriveKeyFromHash(vaultHash, salt);
+                        const encryptedResult = await encryptData(exportedKey, derivedKey);
+                        encryptedKey = Buffer.from(encryptedResult.encryptedData).toString('base64');
+                        iv = Buffer.from(encryptedResult.iv).toString('base64');
+                        
                         response.encryptedKeyB64 = encryptedKey;
                         response.ivB64 = iv;
+                        response.saltB64 = Buffer.from(vaults.get(vaultId).salt).toString('base64');
                     }
                     
                     ws.send(JSON.stringify(response));
@@ -342,6 +334,5 @@ function checkAndSendOfflineMessages(userId) {
         }
     }
 }
-
 
 console.log(`WebSocket server started on port ${PORT}`);
