@@ -1,23 +1,15 @@
 {
-  "name": "the-platform-relay-server",
+  "name": "encrypted-chat-server",
   "version": "1.0.0",
-  "description": "Relay server for The Platform with Real Kyber Post-Quantum Group Key Exchange, encrypted storage, and offline message queuing.",
+  "description": "A WebSocket server for a post-quantum encrypted chat application.",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "nodemon server.js"
+    "start": "node server.js"
   },
-  "author": "Prakhar Solanki",
-  "license": "MIT",
   "dependencies": {
-    "@noble/kyber": "^0.2.0",
-    "express": "^4.18.2",
+    "liboqs-js": "^0.3.0",
     "ws": "^8.18.0"
   },
-  "devDependencies": {
-    "nodemon": "^3.1.0"
-  },
-  "engines": {
-    "node": ">=18.0.0"
-  }
+  "author": "",
+  "license": "ISC"
 }
