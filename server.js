@@ -1,517 +1,506 @@
-const express = require('express');
-const http = require('http');
 const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const app = express();
-const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
-const PORT = process.env.PORT || 3000;
+const oqs = require('oqs'); // For Kyber
 
-// --- Data-at-Rest Encryption Configuration ---
-const ENCRYPTION_KEY = process.env.DATA_ENCRYPTION_KEY || crypto.randomBytes(32); // 256-bit key
-const ENCRYPTION_IV_SIZE = 12; // 12 bytes (96 bits) for AES-GCM
+// --- Configuration ---
+const SERVER_PORT = process.env.PORT || 8080;
+const DATA_FILE = path.join(__dirname, 'encrypted_data.bin');
+// Use a 32-byte (256-bit) key for AES-256-GCM
+const SERVER_AES_KEY_HEX = process.env.SERVER_AES_KEY || crypto.randomBytes(32).toString('hex');
+const SERVER_AES_KEY = Buffer.from(SERVER_AES_KEY_HEX, 'hex');
 
-if (!process.env.DATA_ENCRYPTION_KEY) {
-    console.warn('WARNING: Using auto-generated encryption key. Data will be lost on restart!');
+// Validate key length
+if (SERVER_AES_KEY.length !== 32) {
+    console.error("SERVER_AES_KEY must be a 32-byte (64 hex character) hex string.");
+    process.exit(1);
 }
 
-function encryptForStorage(data) {
-    const iv = crypto.randomBytes(ENCRYPTION_IV_SIZE);
-    const cipher = crypto.createCipheriv('aes-256-gcm', ENCRYPTION_KEY, iv);
-    cipher.setAAD(Buffer.from('platform-storage', 'utf8'));
-    let encrypted = cipher.update(data, 'utf8');
-    encrypted = Buffer.concat([encrypted, cipher.final()]);
-    const authTag = cipher.getAuthTag();
-    const combined = Buffer.concat([iv, authTag, encrypted]);
-    return combined.toString('base64');
+console.log(`Server AES Key Length: ${SERVER_AES_KEY.length} bytes`);
+
+// --- Data Structures ---
+let serverData = {
+    users: {}, // userId -> { lastSeen: timestamp }
+    vaults: {}, // vaultId -> { id, name, type, expiration, creator, members: Set, encryptedKey, iv, salt, kemSecretKey (for private) }
+    messages: {} // vaultId -> [messages]
+};
+
+// --- Data Persistence (Encrypted at Rest) ---
+function encryptData(data) {
+    const iv = crypto.randomBytes(12); // 96-bit IV for GCM
+    const cipher = crypto.createCipher('aes-256-gcm', SERVER_AES_KEY);
+    let encrypted = cipher.update(JSON.stringify(data), 'utf8', 'hex');
+    encrypted += cipher.final('hex');
+    const tag = cipher.getAuthTag().toString('hex');
+    return iv.toString('hex') + ':' + encrypted + ':' + tag;
 }
 
-function decryptFromStorage(encryptedData) {
-    try {
-        const combined = Buffer.from(encryptedData, 'base64');
-        const iv = combined.slice(0, ENCRYPTION_IV_SIZE);
-        const authTag = combined.slice(ENCRYPTION_IV_SIZE, ENCRYPTION_IV_SIZE + 16);
-        const encrypted = combined.slice(ENCRYPTION_IV_SIZE + 16);
-        const decipher = crypto.createDecipheriv('aes-256-gcm', ENCRYPTION_KEY, iv);
-        decipher.setAAD(Buffer.from('platform-storage', 'utf8'));
-        decipher.setAuthTag(authTag);
-        let decrypted = decipher.update(encrypted);
-        decrypted = Buffer.concat([decrypted, decipher.final()]);
-        return decrypted.toString('utf8');
-    } catch (error) {
-        console.error('Failed to decrypt storage data:', error.message);
-        throw new Error('Data decryption failed');
+function decryptData(encryptedDataWithTag) {
+    const parts = encryptedDataWithTag.split(':');
+    if (parts.length !== 3) {
+        throw new Error('Invalid encrypted data format');
     }
+    const iv = Buffer.from(parts[0], 'hex');
+    const encrypted = parts[1];
+    const tag = Buffer.from(parts[2], 'hex');
+    const decipher = crypto.createDecipher('aes-256-gcm', SERVER_AES_KEY);
+    decipher.setAuthTag(tag);
+    let decrypted = decipher.update(encrypted, 'hex', 'utf8');
+    decrypted += decipher.final('utf8');
+    return JSON.parse(decrypted);
 }
 
-// --- Server-side Data Storage with Encryption ---
-const DATA_DIR = path.join(__dirname, 'data');
-const VAULTS_FILE = path.join(DATA_DIR, 'vaults.enc');
-const OFFLINE_MESSAGES_FILE = path.join(DATA_DIR, 'offline_messages.enc');
-const USER_KEYS_FILE = path.join(DATA_DIR, 'user_keys.enc');
-
-if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
-}
-
-let vaults = {};
-let offlineMessages = {};
-let connectedClients = {};
-let userKeys = {};
-
-function loadEncryptedData(filePath, defaultData) {
-    try {
-        if (fs.existsSync(filePath)) {
-            const encryptedData = fs.readFileSync(filePath, 'utf8');
-            const decryptedData = decryptFromStorage(encryptedData);
-            return JSON.parse(decryptedData);
+function loadData() {
+    if (fs.existsSync(DATA_FILE)) {
+        try {
+            const encrypted = fs.readFileSync(DATA_FILE, 'utf8');
+            const data = decryptData(encrypted);
+            // Reconstruct Sets from arrays
+            for (const vaultId in data.vaults) {
+                if (data.vaults[vaultId].members && Array.isArray(data.vaults[vaultId].members)) {
+                    data.vaults[vaultId].members = new Set(data.vaults[vaultId].members);
+                }
+            }
+            console.log("Data loaded from disk.");
+            return data;
+        } catch (err) {
+            console.error("Error loading data from disk:", err);
+            return { users: {}, vaults: {}, messages: {} };
         }
-    } catch (error) {
-        console.error(`Error loading ${filePath}:`, error.message);
-        console.warn(`Using default data for ${path.basename(filePath)}`);
     }
-    return defaultData;
+    return { users: {}, vaults: {}, messages: {} };
 }
 
-function saveEncryptedData(filePath, data) {
+function saveData() {
     try {
-        const serializableData = JSON.parse(JSON.stringify(data, (key, value) => 
-            value instanceof Set ? Array.from(value) : value
-        ));
-        const jsonData = JSON.stringify(serializableData, null, 2);
-        const encryptedData = encryptForStorage(jsonData);
-        const tempFile = filePath + '.tmp';
-        fs.writeFileSync(tempFile, encryptedData, { mode: 0o600 });
-        fs.renameSync(tempFile, filePath);
-        console.log(`Encrypted data saved to ${path.basename(filePath)}`);
-    } catch (error) {
-        console.error(`Error saving to ${filePath}:`, error.message);
-    }
-}
-
-// Load initial data
-console.log('Loading encrypted data from storage...');
-vaults = loadEncryptedData(VAULTS_FILE, {});
-offlineMessages = loadEncryptedData(OFFLINE_MESSAGES_FILE, {});
-userKeys = loadEncryptedData(USER_KEYS_FILE, {});
-
-for (const vaultId in vaults) {
-    if (vaults[vaultId].members && Array.isArray(vaults[vaultId].members)) {
-        vaults[vaultId].members = new Set(vaults[vaultId].members);
-    } else {
-        vaults[vaultId].members = new Set();
-    }
-}
-
-console.log(`Loaded ${Object.keys(vaults).length} vaults, ${Object.keys(offlineMessages).length} offline message queues, ${Object.keys(userKeys).length} user keys`);
-
-// --- Real Kyber Implementation (Server-side) ---
-class ServerKyberKEM {
-    constructor() {
-        this.keySize = 1568; // Kyber-768 public key size
-        this.ciphertextSize = 1088; // Kyber-768 ciphertext size
-        this.sharedSecretSize = 32; // 256-bit shared secret
-    }
-
-    deserializePublicKey(base64Data) {
-        return { data: Buffer.from(base64Data, 'base64'), type: 'kyber-public-key' };
-    }
-
-    serializeCiphertext(ciphertext) {
-        return ciphertext.toString('base64');
-    }
-
-    deserializeCiphertext(base64Data) {
-        return Buffer.from(base64Data, 'base64');
-    }
-
-    async encapsulate(publicKey) {
-        const randomSeed = crypto.randomBytes(32);
-        const sharedSecretInput = Buffer.concat([randomSeed, publicKey.data]);
-        const sharedSecretHash = crypto.createHash('sha256').update(sharedSecretInput).digest();
-        const ciphertext = Buffer.alloc(this.ciphertextSize);
-        let ciphertextInput = Buffer.concat([randomSeed, publicKey.data.slice(0, 256)]);
-        
-        for (let i = 0; i < ciphertext.length; i += 32) {
-            const hash = crypto.createHash('sha256').update(ciphertextInput).digest();
-            const remaining = Math.min(32, ciphertext.length - i);
-            hash.copy(ciphertext, i, 0, remaining);
-            if (i + 32 < ciphertext.length) {
-                ciphertextInput[ciphertextInput.length - 1] = (ciphertextInput[ciphertextInput.length - 1] + 1) % 256;
+        // Convert Sets to arrays for JSON serialization
+        const dataToSave = JSON.parse(JSON.stringify(serverData));
+        for (const vaultId in dataToSave.vaults) {
+            if (dataToSave.vaults[vaultId].members instanceof Set) {
+                dataToSave.vaults[vaultId].members = Array.from(dataToSave.vaults[vaultId].members);
             }
         }
-        return { ciphertext, sharedSecret: sharedSecretHash };
+        const encrypted = encryptData(dataToSave);
+        fs.writeFileSync(DATA_FILE, encrypted, 'utf8');
+        console.log("Data saved to disk.");
+    } catch (err) {
+        console.error("Error saving data to disk:", err);
     }
 }
 
-const serverKyber = new ServerKyberKEM();
-
-// --- Enhanced Cryptography Functions ---
-async function deriveKeyFromHashServer(password, salt) {
-    return new Promise((resolve, reject) => {
-        crypto.pbkdf2(password, salt, 100000, 32, 'sha256', (err, derivedKey) => {
-            if (err) reject(err);
-            resolve(derivedKey);
-        });
-    });
+// --- Helper Functions ---
+function generateVaultHash() {
+    return crypto.randomBytes(32).toString('hex'); // 256-bit random hex string
 }
 
-function encryptDataServer(data, key, iv) {
-    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
-    cipher.setAAD(Buffer.from('vault-data', 'utf8'));
-    const encrypted = Buffer.concat([cipher.update(data), cipher.final()]);
-    const tag = cipher.getAuthTag();
-    return Buffer.concat([encrypted, tag]);
+function deriveKeyFromHash(password, salt) {
+    return crypto.pbkdf2Sync(password, salt, 100000, 32, 'sha256'); // 256-bit key
 }
 
-function decryptDataServer(encryptedDataWithTag, key, iv) {
-    const tagLength = 16;
-    const encryptedData = encryptedDataWithTag.slice(0, encryptedDataWithTag.length - tagLength);
-    const tag = encryptedDataWithTag.slice(encryptedDataWithTag.length - tagLength);
-    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
-    decipher.setAAD(Buffer.from('vault-data', 'utf8'));
+function encryptWithDerivedKey(data, password, salt) {
+    const key = deriveKeyFromHash(password, salt);
+    const iv = crypto.randomBytes(12); // 96-bit IV for GCM
+    const cipher = crypto.createCipher('aes-256-gcm', key);
+    let encrypted = cipher.update(data, 'utf8', 'hex');
+    encrypted += cipher.final('hex');
+    const tag = cipher.getAuthTag().toString('hex');
+    return { encryptedData: encrypted, iv: iv.toString('hex'), tag: tag };
+}
+
+function decryptWithDerivedKey(encryptedDataWithTag, password, salt) {
+    const key = deriveKeyFromHash(password, salt);
+    const parts = encryptedDataWithTag.split(':');
+    if (parts.length !== 3) {
+        throw new Error('Invalid encrypted data format for derived key decryption');
+    }
+    const iv = Buffer.from(parts[0], 'hex');
+    const encrypted = parts[1];
+    const tag = Buffer.from(parts[2], 'hex');
+    const decipher = crypto.createDecipher('aes-256-gcm', key);
     decipher.setAuthTag(tag);
-    const decrypted = Buffer.concat([decipher.update(encryptedData), decipher.final()]);
+    let decrypted = decipher.update(encrypted, 'hex', 'utf8');
+    decrypted += decipher.final('utf8');
     return decrypted;
 }
 
-function createKyberVaultReference(vaultHash) {
-    return crypto.createHash('sha256').update(vaultHash + 'kyber-vault-ref').digest('hex').substring(0, 32);
+function getExpirationTimestamp(expirationTime) {
+    const now = new Date();
+    switch (expirationTime) {
+        case '1h': return new Date(now.getTime() + 60 * 60 * 1000);
+        case '5h': return new Date(now.getTime() + 5 * 60 * 60 * 1000);
+        case '24h': return new Date(now.getTime() + 24 * 60 * 60 * 1000);
+        case '1mo': return new Date(now.setMonth(now.getMonth() + 1));
+        case '3mo': return new Date(now.setMonth(now.getMonth() + 3));
+        case '6mo': return new Date(now.setMonth(now.getMonth() + 6));
+        case '1yr': return new Date(now.setFullYear(now.getFullYear() + 1));
+        case 'never': return null;
+        default: return null;
+    }
 }
 
-function findKyberVaultByHash(vaultHash) {
-    const hashReference = createKyberVaultReference(vaultHash);
-    for (const vaultId in vaults) {
-        const vault = vaults[vaultId];
-        if (vault.isKyberEncrypted && vault.vaultHashReference === hashReference) {
-            return vaultId;
+function checkVaultExpiration() {
+    const now = new Date();
+    let expiredVaults = [];
+    for (const vaultId in serverData.vaults) {
+        const vault = serverData.vaults[vaultId];
+        if (vault.expiration && new Date(vault.expiration) < now) {
+            expiredVaults.push({ id: vaultId, name: vault.name });
         }
     }
-    return null;
+    expiredVaults.forEach(({ id, name }) => {
+        delete serverData.vaults[id];
+        delete serverData.messages[id];
+        console.log(`Vault ${name} (${id}) has expired and been removed.`);
+        // Notify online members (if any)
+        wss.clients.forEach(client => {
+            if (client.readyState === WebSocket.OPEN && serverData.users[client.userId]) {
+                client.send(JSON.stringify({
+                    type: 'vault_expired_notification',
+                    expiredVaultId: id,
+                    expiredVaultName: name
+                }));
+            }
+        });
+    });
+    if (expiredVaults.length > 0) {
+        saveData();
+    }
 }
 
-function storeUserKyberPublicKey(userId, publicKeyB64) {
-    userKeys[userId] = { publicKey: publicKeyB64, keyTimestamp: Date.now() };
-    saveEncryptedData(USER_KEYS_FILE, userKeys);
-    console.log(`Stored Kyber public key for user ${userId.substring(0, 8)}...`);
-}
+// --- WebSocket Server ---
+const wss = new WebSocket.Server({ port: SERVER_PORT });
 
-function getUserKyberPublicKey(userId) {
-    const userKey = userKeys[userId];
-    return userKey ? userKey.publicKey : null;
-}
-
-// --- WebSocket Server Logic ---
 wss.on('connection', (ws) => {
-    let currentUserId = null;
+    console.log('New client connected');
 
     ws.on('message', async (message) => {
-        let data;
         try {
-            data = JSON.parse(message.toString());
-        } catch (e) {
-            ws.send(JSON.stringify({ type: 'error', message: 'Invalid message format.' }));
-            return;
-        }
+            const data = JSON.parse(message);
+            const userId = ws.userId; // Set during 'register'
 
-        if (data.type === 'register') {
-            currentUserId = data.userId;
-            connectedClients[currentUserId] = ws;
-            console.log(`User ${currentUserId.substring(0, 8)}... connected.`);
-            
-            if (offlineMessages[currentUserId]?.length > 0) {
-                ws.send(JSON.stringify({ type: 'offline_messages', messages: offlineMessages[currentUserId] }));
-                delete offlineMessages[currentUserId];
-                saveEncryptedData(OFFLINE_MESSAGES_FILE, offlineMessages);
-            }
-            return;
-        } else if (!currentUserId) {
-            ws.send(JSON.stringify({ type: 'error', message: 'Please register your user ID first.' }));
-            return;
-        }
-
-        try {
             switch (data.type) {
-                case 'store_kyber_public_key':
-                    if (!data.publicKey) {
-                        ws.send(JSON.stringify({ type: 'error', message: 'Public key is required.' }));
-                        return;
+                case 'register':
+                    if (data.userId) {
+                        ws.userId = data.userId;
+                        serverData.users[ws.userId] = { lastSeen: new Date().toISOString() };
+                        console.log(`User registered: ${ws.userId}`);
+                        saveData();
                     }
-                    storeUserKyberPublicKey(currentUserId, data.publicKey);
-                    ws.send(JSON.stringify({ type: 'kyber_key_stored', success: true }));
                     break;
 
                 case 'create_vault':
-                    const vaultId = crypto.randomUUID();
-                    const vaultHash = crypto.randomBytes(32).toString('hex');
-                    let encryptedVaultKey, ivForVaultKey, saltForKey = null, kyberCiphertext = null;
-                    const isKyberEncrypted = data.isKyberEncrypted || false;
-
-                    if (isKyberEncrypted && data.vaultType === 'private') {
-                        if (!data.encryptedVaultKeyB64 || !data.ivB64 || !data.kyberCiphertext) {
-                            ws.send(JSON.stringify({ type: 'error', message: 'Missing Kyber encryption data.' }));
-                            return;
-                        }
-                        encryptedVaultKey = Buffer.from(data.encryptedVaultKeyB64, 'base64');
-                        ivForVaultKey = Buffer.from(data.ivB64, 'base64');
-                        kyberCiphertext = data.kyberCiphertext;
-                    } else {
-                        if (!data.rawVaultKeyB64 || !data.saltB64) {
-                            ws.send(JSON.stringify({ type: 'error', message: 'Missing PBKDF2 encryption data.' }));
-                            return;
-                        }
-                        const rawVaultKey = Buffer.from(data.rawVaultKeyB64, 'base64');
-                        saltForKey = Buffer.from(data.saltB64, 'base64');
-                        ivForVaultKey = crypto.randomBytes(12);
-                        const derivedKeyForVaultKey = await deriveKeyFromHashServer(vaultHash, saltForKey);
-                        encryptedVaultKey = encryptDataServer(rawVaultKey, derivedKeyForVaultKey, ivForVaultKey);
+                    if (!userId) {
+                        ws.send(JSON.stringify({ type: 'error', message: 'User not registered.' }));
+                        break;
                     }
+                    const { vaultName, vaultType, expiration, rawVaultKeyB64, saltB64, clientPublicKeyB64, tempVaultId } = data;
+                    const vaultId = crypto.randomUUID();
+                    const vaultHash = vaultType === 'private' ? `private_${vaultId}` : generateVaultHash();
+                    const expirationDate = getExpirationTimestamp(expiration);
 
-                    const vaultHashReference = isKyberEncrypted ? createKyberVaultReference(vaultHash) : null;
-                    vaults[vaultId] = {
-                        name: data.vaultName,
-                        type: data.vaultType,
-                        expiration: data.expiration,
-                        adminId: currentUserId,
-                        encryptedKeyB64: encryptedVaultKey.toString('base64'),
-                        ivB64: ivForVaultKey.toString('base64'),
-                        saltB64: saltForKey ? saltForKey.toString('base64') : null,
-                        used: data.vaultType === 'private',
-                        members: new Set([currentUserId]),
-                        createdAt: Date.now(),
-                        isKyberEncrypted: isKyberEncrypted,
-                        kyberCiphertext: kyberCiphertext,
-                        vaultHashReference: vaultHashReference
-                    };
+                    if (vaultType === 'private' && clientPublicKeyB64) {
+                        try {
+                            // 1. Server generates its own Kyber key pair
+                            const kem = new oqs.KeyEncapsulation('Kyber512');
+                            const { publicKey: serverPublicKey, secretKey: serverSecretKey } = kem.generateKeyPair();
 
-                    saveEncryptedData(VAULTS_FILE, vaults);
-                    const createResponse = {
-                        type: 'vault_created',
-                        vaultId,
-                        vaultHash,
-                        vaultName: data.vaultName,
-                        vaultType: data.vaultType,
-                        expiration: data.expiration,
-                        encryptedKeyB64: encryptedVaultKey.toString('base64'),
-                        ivB64: ivForVaultKey.toString('base64'),
-                        isKyberEncrypted: isKyberEncrypted
-                    };
-                    if (saltForKey) createResponse.saltB64 = saltForKey.toString('base64');
-                    if (kyberCiphertext) createResponse.kyberCiphertext = kyberCiphertext;
-                    ws.send(JSON.stringify(createResponse));
+                            // 2. Server encapsulates a shared secret using the client's public key
+                            const clientPublicKey = Uint8Array.from(atob(clientPublicKeyB64), c => c.charCodeAt(0));
+                            const ciphertext = kem.encapSecret(clientPublicKey); // This is sent to the client
+
+                            // 3. Server derives the actual vault key from its own shared secret
+                            const serverSharedSecret = kem.getSharedSecret();
+                            const salt = crypto.getRandomValues(new Uint8Array(16)); // Salt for key derivation
+                            const keyMaterial = crypto.pbkdf2Sync(serverSharedSecret, salt, 100000, 32, 'sha256');
+                            const vaultAesKey = crypto.createSecretKey(keyMaterial, { name: 'AES-GCM' });
+
+                            // 4. Export the vault key to raw bytes for storage
+                            const rawVaultKey = await new Promise((resolve, reject) => {
+                                crypto.subtle.exportKey('raw', vaultAesKey)
+                                    .then(resolve)
+                                    .catch(reject);
+                            });
+
+                            // 5. Encrypt the raw vault key with the server's master key for storage
+                            const { encryptedData, iv, tag } = encryptWithDerivedKey(
+                                Buffer.from(rawVaultKey).toString('binary'),
+                                SERVER_AES_KEY_HEX, // Use server's key as "password"
+                                salt // Use the same salt for consistency
+                            );
+
+                            // 6. Store vault data on the server
+                            serverData.vaults[vaultId] = {
+                                id: vaultId,
+                                name: vaultName,
+                                type: vaultType,
+                                expiration: expirationDate ? expirationDate.toISOString() : null,
+                                creator: userId,
+                                members: new Set([userId]),
+                                encryptedKey: encryptedData,
+                                iv: iv,
+                                tag: tag,
+                                salt: salt.toString('hex'),
+                                kemSecretKey: serverSecretKey.toString('base64') // Store server's secret key
+                            };
+                            serverData.messages[vaultId] = [];
+
+                            saveData();
+
+                            // 7. Send response to client with server's public key and salt
+                            ws.send(JSON.stringify({
+                                type: 'vault_created',
+                                vaultId,
+                                vaultHash,
+                                vaultName,
+                                vaultType,
+                                expiration,
+                                serverPublicKeyB64: btoa(String.fromCharCode(...new Uint8Array(serverPublicKey))),
+                                saltB64: btoa(String.fromCharCode(...salt))
+                            }));
+
+                            // Send offline messages if any exist
+                            if (serverData.messages[vaultId] && serverData.messages[vaultId].length > 0) {
+                                ws.send(JSON.stringify({
+                                    type: 'offline_messages',
+                                    messages: serverData.messages[vaultId]
+                                }));
+                            }
+                        } catch (e) {
+                            console.error("Kyber key exchange failed during vault creation:", e);
+                            ws.send(JSON.stringify({ type: 'error', message: 'Failed to perform Kyber key exchange for vault creation.' }));
+                        }
+                    } else if (vaultType === 'public' && rawVaultKeyB64 && saltB64) {
+                        // Standard PBKDF2 encryption for public vaults
+                        const salt = Uint8Array.from(atob(saltB64), c => c.charCodeAt(0));
+                        const rawVaultKey = Uint8Array.from(atob(rawVaultKeyB64), c => c.charCodeAt(0));
+                        const { encryptedData, iv, tag } = encryptWithDerivedKey(
+                            Buffer.from(rawVaultKey).toString('binary'),
+                            vaultHash,
+                            salt
+                        );
+
+                        serverData.vaults[vaultId] = {
+                            id: vaultId,
+                            name: vaultName,
+                            type: vaultType,
+                            expiration: expirationDate ? expirationDate.toISOString() : null,
+                            creator: userId,
+                            members: new Set([userId]),
+                            encryptedKey: encryptedData,
+                            iv: iv,
+                            tag: tag,
+                            salt: salt.toString('hex')
+                        };
+                        serverData.messages[vaultId] = [];
+
+                        saveData();
+
+                        ws.send(JSON.stringify({
+                            type: 'vault_created',
+                            vaultId,
+                            vaultHash,
+                            vaultName,
+                            vaultType,
+                            expiration,
+                            encryptedKeyB64: btoa(String.fromCharCode(...new Uint8Array(Buffer.from(encryptedData, 'hex')))),
+                            ivB64: btoa(String.fromCharCode(...new Uint8Array(Buffer.from(iv, 'hex')))),
+                            saltB64: saltB64
+                        }));
+
+                        // Send offline messages if any exist
+                        if (serverData.messages[vaultId] && serverData.messages[vaultId].length > 0) {
+                            ws.send(JSON.stringify({
+                                type: 'offline_messages',
+                                messages: serverData.messages[vaultId]
+                            }));
+                        }
+                    } else {
+                        ws.send(JSON.stringify({ type: 'error', message: 'Invalid vault creation parameters.' }));
+                    }
                     break;
 
                 case 'join_vault':
-                    const { vaultHash: joinHash, vaultName: userVaultName } = data;
-                    let foundVaultId = findKyberVaultByHash(joinHash) || null;
-
-                    if (!foundVaultId) {
-                        for (const id in vaults) {
-                            const vault = vaults[id];
-                            if (!vault.isKyberEncrypted && vault.saltB64) {
-                                try {
-                                    const tempSalt = Buffer.from(vault.saltB64, 'base64');
-                                    const tempDerivedKey = await deriveKeyFromHashServer(joinHash, tempSalt);
-                                    decryptDataServer(
-                                        Buffer.from(vault.encryptedKeyB64, 'base64'),
-                                        tempDerivedKey,
-                                        Buffer.from(vault.ivB64, 'base64')
-                                    );
-                                    foundVaultId = id;
-                                    break;
-                                } catch {}
-                            }
+                    if (!userId) {
+                        ws.send(JSON.stringify({ type: 'error', message: 'User not registered.' }));
+                        break;
+                    }
+                    const { vaultHash: joinHash, vaultName: joinName, clientPublicKeyB64: joinClientPublicKeyB64 } = data;
+                    let foundVaultId = null;
+                    for (const id in serverData.vaults) {
+                        if (serverData.vaults[id].type === 'private' && joinHash === `private_${id}`) {
+                            foundVaultId = id;
+                            break;
+                        } else if (serverData.vaults[id].type === 'public' && serverData.vaults[id].hash === joinHash) {
+                            foundVaultId = id;
+                            break;
                         }
                     }
 
-                    if (foundVaultId) {
-                        const vault = vaults[foundVaultId];
-                        if (vault.type === 'private' && vault.used) {
-                            ws.send(JSON.stringify({ type: 'error', message: 'Private vault hash already used.' }));
-                            return;
-                        }
-                        vault.members.add(currentUserId);
-                        if (vault.type === 'private') vault.used = true;
+                    if (!foundVaultId) {
+                        ws.send(JSON.stringify({ type: 'error', message: 'Invalid vault hash.' }));
+                        break;
+                    }
 
-                        let responseKyberCiphertext = vault.kyberCiphertext;
-                        if (vault.isKyberEncrypted) {
-                            const userPublicKeyB64 = getUserKyberPublicKey(currentUserId);
-                            if (!userPublicKeyB64) {
-                                ws.send(JSON.stringify({ type: 'error', message: 'Your Kyber public key not found.' }));
-                                return;
+                    const vaultToJoin = serverData.vaults[foundVaultId];
+                    vaultToJoin.members.add(userId);
+
+                    if (vaultToJoin.type === 'private' && joinClientPublicKeyB64 && vaultToJoin.kemSecretKey) {
+                        try {
+                            // 1. Server retrieves its stored secret key
+                            const kem = new oqs.KeyEncapsulation('Kyber512');
+                            kem.secretKey = Uint8Array.from(atob(vaultToJoin.kemSecretKey), c => c.charCodeAt(0));
+
+                            // 2. Server encapsulates a shared secret using the joining client's public key
+                            const clientPublicKey = Uint8Array.from(atob(joinClientPublicKeyB64), c => c.charCodeAt(0));
+                            const ciphertext = kem.encapSecret(clientPublicKey); // This is sent to the client
+
+                            // 3. Server uses the same salt it stored during creation for key derivation
+                            const salt = Buffer.from(vaultToJoin.salt, 'hex');
+
+                            saveData();
+
+                            // 4. Send response to client with ciphertext and salt
+                            ws.send(JSON.stringify({
+                                type: 'vault_joined',
+                                joinedVaultId: foundVaultId,
+                                joinedVaultName: joinName,
+                                joinedVaultType: vaultToJoin.type,
+                                joinedExpiration: vaultToJoin.expiration ? new Date(vaultToJoin.expiration).toISOString() : 'never',
+                                encryptedKeyB64: btoa(String.fromCharCode(...new Uint8Array(ciphertext))),
+                                saltB64: btoa(String.fromCharCode(...salt)),
+                                vaultHash: joinHash,
+                                serverPublicKeyB64: kem.publicKey.toString('base64')
+                            }));
+
+                            // Send offline messages if any exist
+                            if (serverData.messages[foundVaultId] && serverData.messages[foundVaultId].length > 0) {
+                                ws.send(JSON.stringify({
+                                    type: 'offline_messages',
+                                    messages: serverData.messages[foundVaultId]
+                                }));
                             }
-                            const userPublicKey = serverKyber.deserializePublicKey(userPublicKeyB64);
-                            const { ciphertext } = await serverKyber.encapsulate(userPublicKey);
-                            responseKyberCiphertext = serverKyber.serializeCiphertext(ciphertext);
+                        } catch (e) {
+                            console.error("Kyber key exchange failed during vault join:", e);
+                            ws.send(JSON.stringify({ type: 'error', message: 'Failed to perform Kyber key exchange for vault join.' }));
                         }
+                    } else if (vaultToJoin.type === 'public') {
+                        // Standard PBKDF2 decryption for public vaults (re-encrypt for joiner)
+                        const joinSalt = Buffer.from(vaultToJoin.salt, 'hex');
+                        const decryptedVaultKeyBinary = decryptWithDerivedKey(
+                            `${vaultToJoin.iv}:${vaultToJoin.encryptedKey}:${vaultToJoin.tag}`,
+                            joinHash,
+                            joinSalt
+                        );
+                        const { encryptedData, iv, tag } = encryptWithDerivedKey(
+                            decryptedVaultKeyBinary,
+                            joinHash,
+                            joinSalt
+                        );
 
-                        saveEncryptedData(VAULTS_FILE, vaults);
-                        const joinResponse = {
+                        saveData();
+
+                        ws.send(JSON.stringify({
                             type: 'vault_joined',
                             joinedVaultId: foundVaultId,
-                            joinedVaultName: userVaultName,
-                            joinedVaultType: vault.type,
-                            joinedExpiration: vault.expiration,
-                            encryptedKeyB64: vault.encryptedKeyB64,
-                            ivB64: vault.ivB64,
-                            vaultHash: joinHash,
-                            isKyberEncrypted: vault.isKyberEncrypted
-                        };
-                        if (vault.saltB64) joinResponse.saltB64 = vault.saltB64;
-                        if (responseKyberCiphertext) joinResponse.kyberCiphertext = responseKyberCiphertext;
-                        ws.send(JSON.stringify(joinResponse));
+                            joinedVaultName: joinName,
+                            joinedVaultType: vaultToJoin.type,
+                            joinedExpiration: vaultToJoin.expiration ? new Date(vaultToJoin.expiration).toISOString() : 'never',
+                            encryptedKeyB64: btoa(String.fromCharCode(...new Uint8Array(Buffer.from(encryptedData, 'hex')))),
+                            ivB64: btoa(String.fromCharCode(...new Uint8Array(Buffer.from(iv, 'hex')))),
+                            saltB64: joinSalt.toString('base64'),
+                            vaultHash: joinHash
+                        }));
 
-                        const relevantMessages = offlineMessages[currentUserId]?.filter(msg => msg.vaultId === foundVaultId) || [];
-                        if (relevantMessages.length > 0) {
-                            ws.send(JSON.stringify({ type: 'offline_messages', messages: relevantMessages }));
-                            offlineMessages[currentUserId] = offlineMessages[currentUserId].filter(msg => msg.vaultId !== foundVaultId);
-                            if (offlineMessages[currentUserId].length === 0) delete offlineMessages[currentUserId];
-                            saveEncryptedData(OFFLINE_MESSAGES_FILE, offlineMessages);
+                        // Send offline messages if any exist
+                        if (serverData.messages[foundVaultId] && serverData.messages[foundVaultId].length > 0) {
+                            ws.send(JSON.stringify({
+                                type: 'offline_messages',
+                                messages: serverData.messages[foundVaultId]
+                            }));
                         }
                     } else {
-                        ws.send(JSON.stringify({ type: 'error', message: 'Vault not found or hash is incorrect.' }));
+                        ws.send(JSON.stringify({ type: 'error', message: 'Vault type mismatch or missing data for join.' }));
+                        break;
                     }
                     break;
 
                 case 'send_message':
-                    const { vaultId: msgVaultId, senderId, encryptedMessage, iv, timestamp, isFile, fileName, fileMimeType } = data;
-                    const vault = vaults[msgVaultId];
-                    if (vault && vault.members.has(senderId)) {
-                        const messageToSend = {
-                            type: 'new_message',
-                            vaultId: msgVaultId,
-                            senderId,
-                            encryptedMessage,
-                            iv,
-                            timestamp,
-                            isFile: isFile || false,
-                            fileName: fileName || null,
-                            fileMimeType: fileMimeType || null
-                        };
-
-                        let delivered = 0, offline = 0;
-                        vault.members.forEach(memberId => {
-                            if (memberId !== senderId) {
-                                const recipientWs = connectedClients[memberId];
-                                if (recipientWs?.readyState === WebSocket.OPEN) {
-                                    recipientWs.send(JSON.stringify(messageToSend));
-                                    delivered++;
-                                } else {
-                                    if (!offlineMessages[memberId]) offlineMessages[memberId] = [];
-                                    offlineMessages[memberId].push(messageToSend);
-                                    offline++;
-                                }
-                            }
-                        });
-
-                        if (offline > 0) saveEncryptedData(OFFLINE_MESSAGES_FILE, offlineMessages);
-                        console.log(`Message delivered to ${delivered} online, ${offline} offline for vault ${msgVaultId}`);
-                    } else {
-                        ws.send(JSON.stringify({ type: 'error', message: 'Vault not found or you are not a member.' }));
+                    if (!userId || !data.vaultId || !data.encryptedMessage || !data.iv) {
+                        ws.send(JSON.stringify({ type: 'error', message: 'Missing message data.' }));
+                        break;
                     }
+                    const targetVault = serverData.vaults[data.vaultId];
+                    if (!targetVault || !targetVault.members.has(userId)) {
+                        ws.send(JSON.stringify({ type: 'error', message: 'Not a member of this vault.' }));
+                        break;
+                    }
+
+                    const messageObj = {
+                        vaultId: data.vaultId,
+                        senderId: userId,
+                        encryptedMessage: data.encryptedMessage,
+                        iv: data.iv,
+                        timestamp: data.timestamp || new Date().toISOString(),
+                        isFile: data.isFile || false,
+                        fileName: data.fileName || null,
+                        fileMimeType: data.fileMimeType || null
+                    };
+
+                    if (!serverData.messages[data.vaultId]) {
+                        serverData.messages[data.vaultId] = [];
+                    }
+                    serverData.messages[data.vaultId].push(messageObj);
+                    saveData();
+
+                    // Broadcast message to all members of the vault
+                    wss.clients.forEach(client => {
+                        if (client.readyState === WebSocket.OPEN && client.userId && targetVault.members.has(client.userId)) {
+                            client.send(JSON.stringify(messageObj));
+                        }
+                    });
                     break;
 
                 case 'nuke':
-                    const nukeUserId = data.userId;
-                    let vaultsModified = false;
-
-                    for (const id in vaults) {
-                        if (vaults[id].members.has(nukeUserId)) {
-                            vaults[id].members.delete(nukeUserId);
-                            vaultsModified = true;
-                        }
+                    if (!userId) {
+                        ws.send(JSON.stringify({ type: 'error', message: 'User not registered.' }));
+                        break;
                     }
-
-                    if (vaultsModified) saveEncryptedData(VAULTS_FILE, vaults);
-                    if (offlineMessages[nukeUserId]) delete offlineMessages[nukeUserId];
-                    if (userKeys[nukeUserId]) delete userKeys[nukeUserId];
-                    if (connectedClients[nukeUserId]) {
-                        connectedClients[nukeUserId].close();
-                        delete connectedClients[nukeUserId];
+                    // Remove user from all vaults
+                    for (const vaultId in serverData.vaults) {
+                        serverData.vaults[vaultId].members.delete(userId);
+                        // If vault becomes empty, optionally remove it
+                        // if (serverData.vaults[vaultId].members.size === 0) {
+                        //     delete serverData.vaults[vaultId];
+                        //     delete serverData.messages[vaultId];
+                        // }
                     }
-
-                    saveEncryptedData(OFFLINE_MESSAGES_FILE, offlineMessages);
-                    saveEncryptedData(USER_KEYS_FILE, userKeys);
-                    ws.send(JSON.stringify({ type: 'nuke_complete', message: 'All data cleared.' }));
+                    // Remove user data
+                    delete serverData.users[userId];
+                    saveData();
+                    console.log(`User data nuked for: ${userId}`);
                     break;
 
                 default:
                     ws.send(JSON.stringify({ type: 'error', message: 'Unknown message type.' }));
-                    break;
             }
-        } catch (error) {
-            console.error(`Error processing message from ${currentUserId}:`, error);
-            ws.send(JSON.stringify({ type: 'error', message: 'Internal server error occurred.' }));
+        } catch (err) {
+            console.error('Error processing message:', err, message);
+            ws.send(JSON.stringify({ type: 'error', message: 'Internal server error.' }));
         }
     });
 
     ws.on('close', () => {
-        if (currentUserId) {
-            console.log(`User ${currentUserId.substring(0, 8)}... disconnected.`);
-            delete connectedClients[currentUserId];
+        console.log('Client disconnected');
+        // Optionally update lastSeen timestamp for the user
+        if (ws.userId && serverData.users[ws.userId]) {
+             serverData.users[ws.userId].lastSeen = new Date().toISOString();
+             saveData();
         }
-    });
-
-    ws.on('error', (error) => {
-        console.error('WebSocket error:', error);
-        if (currentUserId) delete connectedClients[currentUserId];
     });
 });
 
-// --- Vault Expiration Management ---
-function parseExpirationTime(expirationStr) {
-    if (expirationStr === 'never') return 0;
-    const timeValue = parseInt(expirationStr.slice(0, -1));
-    const timeUnit = expirationStr.slice(-1);
-    const timeUnitLong = expirationStr.slice(-2);
-
-    switch (timeUnitLong) {
-        case 'mo': return timeValue * 30 * 24 * 60 * 60 * 1000;
-        case 'yr': return timeValue * 365 * 24 * 60 * 60 * 1000;
-        default:
-            switch (timeUnit) {
-                case 'h': return timeValue * 60 * 60 * 1000;
-                case 'd': return timeValue * 24 * 60 * 60 * 1000;
-                default: return 24 * 60 * 60 * 1000;
-            }
-    }
-}
-
-function cleanupExpiredVaults() {
-    const now = Date.now();
-    const expiredVaults = [];
-
-    for (const vaultId in vaults) {
-        const vault = vaults[vaultId];
-        if (vault.expiration !== 'never') {
-            const expirationTime = parseExpirationTime(vault.expiration);
-            if (now - vault.createdAt > expirationTime) {
-                expiredVaults.push({ id: vaultId, name: vault.name, members: Array.from(vault.members) });
-            }
-        }
-    }
-
-    expiredVaults.forEach(({ id, name, members }) => {
-        delete vaults[id];
-        members.forEach(memberId => {
-            const memberWs = connectedClients[memberId];
-            if (memberWs?.readyState === WebSocket.OPEN) {
-                memberWs.send(JSON.stringify({ type: 'vault_expired_notification', expiredVaultId: id, expiredVaultName: name }));
-            }
-        });
-    });
-
-    if (expiredVaults.length > 0) saveEncryptedData(VAULTS_FILE, vaults);
-}
-
-setInterval(cleanupExpiredVaults, 60 * 60 * 1000);
-
-// --- Server Startup ---
-server.listen(PORT, () => {
-    console.log(`🚀 Server running on port ${PORT}`);
-    console.log(`🔑 Data-at-rest encryption: ${process.env.DATA_ENCRYPTION_KEY ? 'Enabled (env key)' : 'Enabled (auto-generated key)'}`);
-    console.log(`📂 Data directory: ${DATA_DIR}`);
-    cleanupExpiredVaults();
-});
+// --- Server Initialization ---
+serverData = loadData();
+setInterval(checkVaultExpiration, 60 * 1000); // Check every minute
+console.log(`Server running on port ${SERVER_PORT}`);
