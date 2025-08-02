@@ -1,29 +1,13 @@
 {
-  "name": "the-platform",
+  "name": "the-platform-server",
   "version": "1.0.0",
-  "description": "A secure chat application with post-quantum Kyber encryption for private vaults.",
+  "description": "Server for The Platform - Secure Messaging",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "nodemon server.js"
+    "start": "node server.js"
   },
-  "keywords": [
-    "chat",
-    "encryption",
-    "kyber",
-    "post-quantum",
-    "websocket"
-  ],
-  "author": "Prakhar Solanki",
-  "license": "MIT",
   "dependencies": {
-    "ws": "^8.17.1",
-    "liboqs-node": "^0.4.0"
-  },
-  "devDependencies": {
-    "nodemon": "^3.1.4"
-  },
-  "engines": {
-    "node": ">=16.0.0"
+    "oqs": "^0.8.0",
+    "ws": "^8.16.0"
   }
 }
