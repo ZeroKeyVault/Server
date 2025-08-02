@@ -1,11 +1,12 @@
 {
-  "name": "the-platform",
+  "name": "relay-server",
   "version": "1.0.0",
-  "description": "Encrypted chat platform using Kyber",
-  "dependencies": {
-    "http-server": "^14.1.1"
-  },
+  "main": "server.js",
   "scripts": {
-    "start": "http-server . -p $PORT"
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.17.1",
+    "socket.io": "^4.1.2"
   }
 }
