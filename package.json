@@ -7,7 +7,6 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "liboqs-js": "^0.3.0",
     "ws": "^8.18.0"
   },
   "author": "",
